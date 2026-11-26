@@ -55,3 +55,15 @@ jobs:
         run: |
           ls -la work/android
           echo "Environment check complete"
+      - name: Build Android APK
+        working-directory: work/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace
+
+      - name: Upload Android APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: FaceFusion-Mobile-v0.9.41
+          path: work/android/**/build/outputs/apk/**/*.apk
+          if-no-files-found: error
