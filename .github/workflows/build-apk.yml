@@ -8,7 +8,11 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    env:
+      QAIRT_VERSION: "2.45.0.260326"
 
     steps:
       - name: Checkout v0.9.41
@@ -22,21 +26,18 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Locate Android SDK Manager
+      - name: Configure Android SDK
         run: |
-          echo "Android SDK: $ANDROID_HOME"
-          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -path "*/bin/sdkmanager" -type f | sort -V | tail -n 1)
           test -n "$SDKMANAGER"
           echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
-          echo "Found: $SDKMANAGER"
-          "$SDKMANAGER" --version
 
-      - name: Accept Android licenses
+      - name: Accept Android Licenses
         run: |
           set +o pipefail
           yes | "$SDKMANAGER" --licenses
 
-      - name: Install Android dependencies
+      - name: Install Android Dependencies
         run: |
           "$SDKMANAGER" \
             "platform-tools" \
@@ -45,25 +46,32 @@ jobs:
             "ndk;27.2.12479018" \
             "cmake;3.22.1"
 
-      - name: Check Gradle
-        working-directory: work/android
+      - name: Download Qualcomm QAIRT SDK
         run: |
-          chmod +x gradlew
-          ./gradlew --version
+          mkdir -p "$RUNNER_TEMP/qairt-sdk"
+          URL="https://softwarecenter.qualcomm.com/api/download/software/sdks/Qualcomm_AI_Runtime_Community/All/${QAIRT_VERSION}/v${QAIRT_VERSION}.zip"
+          curl -fL --retry 3 "$URL" -o "$RUNNER_TEMP/qairt.zip"
+          unzip -q "$RUNNER_TEMP/qairt.zip" -d "$RUNNER_TEMP/qairt-sdk"
+          HEADER=$(find "$RUNNER_TEMP/qairt-sdk" -path "*/include/QNN/QnnBackend.h" -print -quit)
+          test -n "$HEADER"
+          SDK_ROOT="${HEADER%/include/QNN/QnnBackend.h}"
+          echo "QNN_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "QAIRT_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "SDK located at $SDK_ROOT"
 
-      - name: Check native dependencies
+      - name: Stage QNN Libraries
         run: |
-          ls -la work/android
-          echo "Environment check complete"
+          bash work/android/stage_qnn.sh
+
       - name: Build Android APK
         working-directory: work/android
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --stacktrace
+          ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Upload Android APK
         uses: actions/upload-artifact@v4
         with:
-          name: FaceFusion-Mobile-v0.9.41
-          path: work/android/**/build/outputs/apk/**/*.apk
+          name: FaceFusion-Mobile-0.9.41
+          path: work/android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
