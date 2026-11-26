@@ -1,0 +1,43 @@
+name: FaceFusion Android Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout v0.9.41
+        uses: actions/checkout@v4
+        with:
+          ref: afe1467e4c50c05c401283caedd3795d9d2d88d1
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android dependencies
+        run: |
+          sdkmanager "platforms;android-35" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1"
+
+      - name: Check Gradle
+        working-directory: work/android
+        run: |
+          chmod +x gradlew
+          ./gradlew --version
+
+      - name: Check native dependencies
+        run: |
+          ls -la work/android
+          echo "Environment check complete"
