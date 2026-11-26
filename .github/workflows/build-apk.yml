@@ -22,19 +22,24 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Check Android SDK
+      - name: Locate Android SDK Manager
         run: |
-          echo "$ANDROID_HOME"
-          which sdkmanager
-          sdkmanager --version
+          echo "Android SDK: $ANDROID_HOME"
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager | sort -V | tail -n 1)
+          test -n "$SDKMANAGER"
+          echo "SDKMANAGER=$SDKMANAGER" >> "$GITHUB_ENV"
+          echo "Found: $SDKMANAGER"
+          "$SDKMANAGER" --version
 
       - name: Accept Android licenses
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
+          set +o pipefail
+          yes | "$SDKMANAGER" --licenses
 
       - name: Install Android dependencies
         run: |
-          sdkmanager "platform-tools" \
+          "$SDKMANAGER" \
+            "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0" \
             "ndk;27.2.12479018" \
