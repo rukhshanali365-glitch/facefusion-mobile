@@ -50,11 +50,12 @@ if(FF_NCNN)
             target_link_libraries(ffnative "${NCNN_DIR}/lib/lib${_gllib}.a")
         endif()
     endforeach()
-    # OpenMP: libncnn.a built with NCNN_OPENMP=ON carries __kmpc_* symbols; if we
-    # chose NCNN_OPENMP=OFF (as we do in CI) there is no such dependency and libomp.a
-    # may be absent. Link it only when present.
+    # The published Android Vulkan archives use OpenMP. Use the NDK's static
+    # runtime when staging has not supplied a matching archive of its own.
     if(EXISTS "${NCNN_DIR}/lib/libomp.a")
         target_link_libraries(ffnative "${NCNN_DIR}/lib/libomp.a")
+    else()
+        target_link_options(ffnative PRIVATE -fopenmp -static-openmp)
     endif()
     target_link_libraries(ffnative android)
 endif()

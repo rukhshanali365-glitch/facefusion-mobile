@@ -20,6 +20,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
 import com.facefusion.mobile.ui.*
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -86,39 +87,14 @@ class MainActivity : ComponentActivity() {
     private val sourceUri: Uri? get() = sources.getOrNull(swapSourceIndex)?.uri
     private val sourceThumb: Bitmap? get() = sources.getOrNull(swapSourceIndex)?.thumb
 
-    // ---- Assign per person, on the SWAP screen (Live has its own, below).
-    //
-    // Live decides by TRACKING -- it has a sequence of frames and a person moving through
-    // them. A video swap has no such thing at the moment the user is choosing: there is
-    // one still frame on screen. So a tap here stores the person's IDENTITY, and native
-    // matches it on every frame of the run.
     private var swapAssignMode by mutableStateOf(false)
-    /** The brush: which source the NEXT tapped person gets, or their own face back. */
     private var swapBrushKeepOriginal by mutableStateOf(false)
     private var swapSelectedPerson by mutableIntStateOf(-1)
-    /**
-     * The detected people shown by Assign per person, captured ONCE per target.
-     *
-     * These deliberately do not follow [originalFrame]. A video preview changes that
-     * bitmap for every seek/playback step; rebuilding the row from it made the detector's
-     * score order become the user's Person 1/2 identity, so two people could exchange
-     * places without a tap. The saved frame is also the exact frame used when a person is
-     * assigned, so the displayed thumbnail, box and identity all describe one picture.
-     */
-    private var swapPersonSnapshot by mutableStateOf<Bitmap?>(null)
-    private var swapPersonBoxes by mutableStateOf<FloatArray?>(null)
-    private var swapPersonSnapshotTarget by mutableIntStateOf(-1)
+    private var mediaPeople = MediaPeople<Bitmap>()
     private var swapPersonThumbs by mutableStateOf<List<Bitmap>>(emptyList())
-    /** person index -> source slot, or [KEEP_ORIGINAL]. */
+    private var peopleScanning by mutableStateOf(false)
+    private var peopleScanned = false
     private var swapPersonAssignments by mutableStateOf<Map<Int, Int>>(emptyMap())
-    /**
-     * person index -> their 512-float identity.
-     *
-     * ⚠ Kept in Kotlin because pressing Swap builds a FRESH pipeline and every assignment
-     * on the warm one goes with it. Without this the mode would work perfectly in the
-     * preview and do nothing at all in the output -- the worst shape a bug can take.
-     */
-    private var swapPersonIdentity by mutableStateOf<Map<Int, FloatArray>>(emptyMap())
     private var liveLargestOnly by mutableStateOf(false)
     private var targetFile by mutableStateOf<File?>(null)
     private var targetName by mutableStateOf<String?>(null)
@@ -176,8 +152,9 @@ class MainActivity : ComponentActivity() {
      */
     private var targetVersion by mutableStateOf(0)
     private var durationMs by mutableStateOf(0L)
-    private var trimStartMs by mutableStateOf(0f)
-    private var trimEndMs by mutableStateOf(0f)
+    private var timeline by mutableStateOf(VideoTimeline())
+    private val trimStartMs get() = timeline.startMs
+    private val trimEndMs get() = timeline.endMs
 
     /**
      * The runtime knobs, restored from the last run.  Held here rather than inside the
@@ -306,7 +283,7 @@ class MainActivity : ComponentActivity() {
      * The lips boxes and identities, in list order (parallel lists).
      *
      * Kept in Kotlin because pressing Swap builds a FRESH pipeline, exactly like
-     * [swapPersonIdentity]: [restoreLipReference] hands them back, so the export
+     * the swap gallery: the lips selection is restored independently, so the export
      * never depends on JNI-global timing. Empty = every face is synced.
      */
     private var lipBoxes by mutableStateOf<List<FloatArray>>(emptyList())
@@ -611,24 +588,16 @@ class MainActivity : ComponentActivity() {
         }
     }
     private val MAX_SOURCE_EDGE get() = decodeCaps.first
-    private val MAX_TARGET_EDGE get() = decodeCaps.second
 
     private var targetW by mutableStateOf(0)
     private var targetH by mutableStateOf(0)
 
-    /**
-     * The trim handle the previews are following.
-     *
-     * Both panes used to show the start frame unconditionally, so dragging the END handle
-     * changed nothing on screen and read as a broken preview. Whichever handle moved last
-     * is the one being looked at.
-     */
-    private var previewEdge by mutableStateOf(TrimEdge.Start)
-
-    /** The position both panes are previewing: whichever handle was touched last. */
-    private val previewAtMs: Float
-        get() = if (previewEdge == TrimEdge.End) trimEndMs else trimStartMs
+    private val previewAtMs get() = timeline.positionMs
+    private var previewRevision = 0L
+    private var previewSettingsRevision = 0L
+    private var seekingPreview = false
     private var scrubJob: Job? = null
+    private var targetCloseJob: Job? = null
 
     /** The debounced redraw owned by [previewOptionsChanged]. One at a time. */
     private var refreshJob: Job? = null
@@ -889,7 +858,6 @@ class MainActivity : ComponentActivity() {
                 else -> person to slot
             }
         }.toMap()
-        swapPersonIdentity = swapPersonIdentity.filterKeys { it in swapPersonAssignments }
         fun shift(i: Int) = (if (i > index) i - 1 else i)
             .coerceIn(0, sources.lastIndex.coerceAtLeast(0))
         swapSourceIndex = shift(swapSourceIndex)
@@ -968,161 +936,159 @@ class MainActivity : ComponentActivity() {
                 return "source ${i + 1}: ${NativePipe.lastError()}"
         }
         NativePipe.setActiveSource(swapSourceIndex.coerceIn(0, prepared.slots.lastIndex))
-        NativePipe.setFaceAssignEnabled(swapAssignMode)
         return null
     }
 
-    /** Forget every per-person choice and turn the mode off, natively as well as here. */
+    /** Reset the assignment controls when the last source is removed. */
     private fun resetSwapAssign() {
         swapAssignMode = false
-        resetSwapPersonState()
-        swapBrushKeepOriginal = false
-        NativePipe.setFaceAssignEnabled(false)
+        clearSwapAssignments()
     }
 
-    /** Forget the target-specific people without changing whether the mode is enabled. */
     private fun resetSwapPersonState() {
         swapSelectedPerson = -1
-        swapPersonSnapshot = null
-        swapPersonBoxes = null
-        swapPersonSnapshotTarget = -1
+        swapBrushKeepOriginal = false
+        mediaPeople = MediaPeople()
         swapPersonThumbs = emptyList()
         swapPersonAssignments = emptyMap()
-        swapPersonIdentity = emptyMap()
-        NativePipe.clearFaceSourceAssignments()
+        peopleScanned = false
     }
 
-    /**
-     * The Swap screen's source row: point at a face that is ALREADY a slot.
-     *
-     * ⚠ It adds nothing, which is why it needs no check of its own: every slot in the
-     * list was gated on the way into the pipeline that holds it (see the gate hook in
-     * refreshSwapped, which covers all of them, not just the first). Changing which
-     * gated slot is active processes nothing new.
-     */
     private fun selectSwapSource(index: Int) {
         if (index !in sources.indices) return
         swapBrushKeepOriginal = false
         swapSourceIndex = index
-        if (previewWarm) NativePipe.setActiveSource(index)
-        // In assign mode the row is a BRUSH: picking a source while a person is selected
-        // applies it to them at once, which is what makes either tap order work.
         if (swapAssignMode && swapSelectedPerson >= 0)
-            assignSwapPerson(swapSelectedPerson, index, keepOriginal = false)
+            assignSwapPerson(swapSelectedPerson, index)
         else previewOptionsChanged(reloads = false)
     }
 
-    /** The other brush: the next person tapped keeps the face they were filmed with. */
     private fun selectSwapKeepOriginal() {
-        if (!swapAssignMode) return
         swapBrushKeepOriginal = true
-        if (swapSelectedPerson >= 0)
-            assignSwapPerson(swapSelectedPerson, KEEP_ORIGINAL, keepOriginal = true)
+        if (swapSelectedPerson >= 0) assignSwapPerson(swapSelectedPerson, KEEP_ORIGINAL)
     }
 
-    /**
-     * Record what happens to [person] -- one of the faces detected in the frame on screen.
-     *
-     * Runs off the main thread: it re-analyses the whole frame to find the identity under
-     * the tap, which is a detector pass plus an embedding, not a lookup.
-     */
-    private fun assignSwapPerson(person: Int, source: Int, keepOriginal: Boolean) {
+    private fun assignSwapPerson(person: Int, source: Int) {
         if (!swapAssignMode || person !in swapPersonThumbs.indices) return
-        if (!keepOriginal && source !in sources.indices) return
-        if (!previewWarm) {
-            // Nothing to assign ON. Said out loud, because the alternative is a tap that
-            // silently does nothing while the pipeline is still coming up.
-            status = getString(R.string.swap_assign_not_ready)
-            return
-        }
-        // Use the frozen detection photo, not the latest video preview frame. The row and
-        // its boxes are target-specific; using the moving frame here reintroduced the same
-        // Person N -> another face problem that the static thumbnails are meant to remove.
-        val frame = swapPersonSnapshot ?: return
-        val box = swapPersonBoxes?.asList()?.chunked(5)?.getOrNull(person) ?: return
-        val soft = frame.asArgb8888() ?: return
-        val px = IntArray(soft.width * soft.height)
-        soft.getPixels(px, 0, soft.width, 0, 0, soft.width, soft.height)
-        val cx = (box[0] + box[2]) / 2f
-        val cy = (box[1] + box[3]) / 2f
-        lifecycleScope.launch {
-            val identity = withContext(Dispatchers.Default) {
-                NativePipe.assignFaceAt(
-                    NativePipe.argbToBgr(px, soft.width, soft.height), soft.width, soft.height,
-                    cx, cy, if (keepOriginal) 0 else source, keepOriginal)
-            }
-            if (identity.size != 512) {
-                status = getString(R.string.swap_assign_failed, person + 1)
-                return@launch
-            }
-            swapSelectedPerson = person
-            swapBrushKeepOriginal = keepOriginal
-            swapPersonAssignments = swapPersonAssignments +
-                (person to if (keepOriginal) KEEP_ORIGINAL else source)
-            swapPersonIdentity = swapPersonIdentity + (person to identity)
-            status = if (keepOriginal)
-                         getString(R.string.swap_assign_kept, person + 1)
-                     else getString(R.string.swap_assign_set, person + 1, source + 1)
-            // No reload: the assignment is already on the warm pipeline, and this only
-            // needs the swapped pane redrawn through it.
-            previewOptionsChanged(reloads = false)
-        }
+        if (source != KEEP_ORIGINAL && source !in sources.indices) return
+        swapPersonAssignments = swapPersonAssignments + (person to source)
+        status = if (source == KEEP_ORIGINAL) getString(R.string.swap_assign_kept, person + 1)
+                 else getString(R.string.swap_assign_set, person + 1, source + 1)
+        previewOptionsChanged(reloads = false)
     }
 
-    /** Tap a face in the row: select them, and apply whatever the brush currently is. */
     private fun selectSwapPerson(person: Int) {
-        if (person !in swapPersonThumbs.indices) return
+        if (person !in swapPersonThumbs.indices || sources.isEmpty()) return
         swapSelectedPerson = person
-        if (!swapAssignMode) return
-        if (swapBrushKeepOriginal) assignSwapPerson(person, KEEP_ORIGINAL, keepOriginal = true)
-        else assignSwapPerson(person, swapSourceIndex, keepOriginal = false)
+        swapAssignMode = true
+        assignSwapPerson(person, if (swapBrushKeepOriginal) KEEP_ORIGINAL else swapSourceIndex)
     }
 
     private fun toggleSwapAssign() {
         swapAssignMode = !swapAssignMode
-        resetSwapPersonState()
+        swapSelectedPerson = -1
         swapBrushKeepOriginal = false
-        NativePipe.setFaceAssignEnabled(swapAssignMode)
-        if (swapAssignMode) {
-            // Keep the native swap selector clean: a stale reference would win
-            // inside swapAll and silently cut assign mode down to one face.
-            NativePipe.clearReferenceFace()
-            // The row is a row of DETECTED people, so the boxes have to exist first.
-            showFaceBoxes = true
-            faceBoxes = null
-            refreshSwapped(force = true)
-        } else {
-            swapPersonThumbs = emptyList()
-            previewOptionsChanged(reloads = false)
-        }
+        previewOptionsChanged(reloads = false)
     }
 
     private fun clearSwapAssignments() {
         swapPersonAssignments = emptyMap()
-        swapPersonIdentity = emptyMap()
         swapSelectedPerson = -1
         swapBrushKeepOriginal = false
-        NativePipe.clearFaceSourceAssignments()
         status = getString(R.string.swap_assign_cleared)
         previewOptionsChanged(reloads = false)
     }
 
-    /**
-     * Every remembered assignment, pushed onto the pipeline that is loaded RIGHT NOW.
-     *
-     * Called after each init -- the preview's, the run's, the player's -- because native
-     * assignments do not survive one. Returns how many landed.
-     */
-    private fun restoreSwapAssignments(): Int {
-        if (!swapAssignMode) return 0
-        var n = 0
-        for ((person, slot) in swapPersonAssignments) {
-            val identity = swapPersonIdentity[person] ?: continue
-            val keep = slot == KEEP_ORIGINAL
-            if (NativePipe.restoreFaceAssignment(identity, if (keep) 0 else slot, keep)) n++
-            else appendLog("could not restore the choice for person ${person + 1}")
+    private suspend fun acquireUiPipe(owner: String, timeoutMs: Long): Boolean {
+        val deadline = android.os.SystemClock.elapsedRealtime() + timeoutMs
+        while (!PipeGuard.acquire(owner)) {
+            if (android.os.SystemClock.elapsedRealtime() >= deadline) return false
+            delay(30)
         }
-        return n
+        return true
+    }
+
+    private suspend fun discoverPeople(frame: Bitmap, version: Int): Boolean {
+        while (!PipeGuard.acquire("face discovery")) {
+            if (version != targetVersion || busy || preparing) return false
+            delay(30)
+        }
+        val catalog = mediaPeople
+        val found = try {
+            if (!PipeGuard.uninterrupted(lastPipeSeq)) {
+                lastPipeSeq = 0
+                return false
+            }
+            lastPipeSeq = PipeGuard.sequence
+            withContext(Dispatchers.Default) {
+                val verdict = ContentGate.inspectStill(frame, R.string.gate_subject_this_frame)
+                if (!verdict.permitted) return@withContext FloatArray(0)
+                val soft = frame.asArgb8888() ?: return@withContext FloatArray(0)
+                val pixels = IntArray(soft.width * soft.height)
+                soft.getPixels(pixels, 0, soft.width, 0, 0, soft.width, soft.height)
+                NativePipe.discoverMediaFaces(
+                    NativePipe.argbToBgr(pixels, soft.width, soft.height),
+                    soft.width, soft.height, catalog.gallery())
+            }
+        } finally {
+            PipeGuard.release()
+            if (lastPipeSeq == 0) refreshSwapped(force = true)
+        }
+        if (version != targetVersion || catalog !== mediaPeople) return false
+        catalog.add(found) { record ->
+            cropPersonThumb(frame, listOf(record[0] * frame.width, record[1] * frame.height,
+                record[2] * frame.width, record[3] * frame.height))
+        }
+        swapPersonThumbs = catalog.thumbnails()
+        return true
+    }
+
+    private suspend fun scanTargetPeople() {
+        val version = targetVersion
+        peopleScanning = true
+        try {
+            val photo = targetImage
+            val video = targetFile
+            peopleScanned = when {
+                photo != null -> discoverPeople(photo, version)
+                video != null -> withContext(Dispatchers.IO) {
+                    val decoder = FrameSeeker.open(video.absolutePath) ?: return@withContext true
+                    decoder.use {
+                        it.scanFrames(500_000L) { bgr ->
+                            val width = it.outWidth
+                            val height = it.outHeight
+                            val scale = minOf(1f, 1280f / maxOf(width, height))
+                            val w = (width * scale).toInt().coerceAtLeast(1)
+                            val h = (height * scale).toInt().coerceAtLeast(1)
+                            val pixels = NativePipe.bgrToArgb(bgr, width, height, w, h)
+                            val bitmap = Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
+                            try {
+                                withContext(Dispatchers.Main) { discoverPeople(bitmap, version) }
+                            } finally {
+                                bitmap.recycle()
+                            }
+                        }
+                    }
+                }
+                else -> false
+            }
+            if (peopleScanned && swapAssignMode) previewOptionsChanged(reloads = false)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (e: Exception) {
+            appendLog("face discovery: ${e.message}")
+        } finally {
+            peopleScanning = false
+        }
+    }
+
+    private fun configureMediaAssignments(still: Boolean, sequential: Boolean): Boolean {
+        if (!swapAssignMode || !opts.swapsFace) return false
+        check(NativePipe.setMediaAssignments(mediaPeople.gallery(),
+            mediaPeople.slots(swapPersonAssignments), still, sequential)) {
+            "Could not load face assignments"
+        }
+        return true
     }
 
     /**
@@ -1910,7 +1876,7 @@ class MainActivity : ComponentActivity() {
                 // switch's initial value, because the detector has to have run first -- and
                 // it is exactly the question the user has when a second face is on screen.
                 // One yoloface pass, ~2 ms, and no identity work at all.
-                LaunchedEffect(originalFrame, showFaceBoxes, swapAssignMode, previewWarm,
+                LaunchedEffect(originalFrame, showFaceBoxes, previewWarm,
                                busy, targetVersion, faceDetectNonce) {
                     val frame = originalFrame
                     // The boxes belong to ONE frame. The moment the frame changes they are
@@ -1926,17 +1892,25 @@ class MainActivity : ComponentActivity() {
                         if (!showFaceBoxes && !decide) faceBoxes = null
                         return@LaunchedEffect
                     }
-                    val found = withContext(Dispatchers.Default) {
-                        runCatching {
-                            val soft = frame.asArgb8888()
-                                ?: return@runCatching null
-                            val px = IntArray(soft.width * soft.height)
-                            soft.getPixels(px, 0, soft.width, 0, 0, soft.width, soft.height)
-                            NativePipe.detectFaces(
-                                NativePipe.argbToBgr(px, soft.width, soft.height),
-                                soft.width, soft.height)
-                        }.getOrNull()
+                    if (!acquireUiPipe("face boxes", 4000)) return@LaunchedEffect
+                    val found = try {
+                        if (!PipeGuard.uninterrupted(lastPipeSeq)) return@LaunchedEffect
+                        lastPipeSeq = PipeGuard.sequence
+                        withContext(Dispatchers.Default) {
+                            runCatching {
+                                val soft = frame.asArgb8888()
+                                    ?: return@runCatching null
+                                val px = IntArray(soft.width * soft.height)
+                                soft.getPixels(px, 0, soft.width, 0, 0, soft.width, soft.height)
+                                NativePipe.detectFaces(
+                                    NativePipe.argbToBgr(px, soft.width, soft.height),
+                                    soft.width, soft.height)
+                            }.getOrNull()
+                        }
+                    } finally {
+                        PipeGuard.release()
                     }
+                    if (originalFrame !== frame) return@LaunchedEffect
                     if (decide) {
                         // Once per target, whatever the answer: a user who turns the
                         // overlay back off must not have it turned on again by the next
@@ -1949,30 +1923,20 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     faceBoxes = if (showFaceBoxes) found else null
-                    // Assign per person uses a PHOTO snapshot, not the moving preview.
-                    // The detector may still refresh faceBoxes for the optional overlay,
-                    // but the row and its assignment coordinates are created only once per
-                    // target. This removes thumbnail churn and prevents detector score
-                    // order from silently changing what Person 1/2 means.
-                    if (swapAssignMode && showFaceBoxes && found != null &&
-                        swapPersonSnapshotTarget != targetVersion) {
-                        swapPersonSnapshot = frame
-                        swapPersonBoxes = found.copyOf()
-                        swapPersonThumbs = found.asList().chunked(5).mapNotNull { b ->
-                            if (b.size < 4) null else cropPersonThumb(frame, b)
-                        }
-                        swapPersonSnapshotTarget = targetVersion
-                    }
                     faceBoxFrame = frame
                 }
 
-                LaunchedEffect(sourceUri, targetVersion, modelsMissing, opts.swapsFace) {
+                LaunchedEffect(targetVersion, previewWarm, busy, preparing, screen) {
+                    if (screen == Screen.Swap && previewWarm && !busy && !preparing && !peopleScanned)
+                        scanTargetPeople()
+                }
+
+                LaunchedEffect(sources.map { it.uri }, targetVersion, modelsMissing, opts.swapsFace, preparing) {
                     android.util.Log.d("ffpreview", "autowarm fired: src=" +
                         (sourceUri != null) + " tgt=" +
                         (targetFile != null || targetImage != null) +
                         " missing=" + modelsMissing + " run=" + busy)
-                    if ((sourceUri != null || !opts.swapsFace) &&
-                        (targetFile != null || targetImage != null) && !modelsMissing && !busy) {
+                    if ((targetFile != null || targetImage != null) && !modelsMissing && !busy) {
                         refreshSwapped(force = true)
                     }
                 }
@@ -2000,6 +1964,7 @@ class MainActivity : ComponentActivity() {
                                 onSelectSource = ::selectSwapSource,
                                 assignMode = swapAssignMode,
                                 personThumbs = swapPersonThumbs,
+                                peopleScanning = peopleScanning,
                                 selectedPerson = swapSelectedPerson,
                                 personAssignments = swapPersonAssignments,
                                 keepOriginalBrush = swapBrushKeepOriginal,
@@ -2014,6 +1979,8 @@ class MainActivity : ComponentActivity() {
                                 trimStartMs = trimStartMs,
                                 trimEndMs = trimEndMs,
                                 onTrimChange = ::onTrimChanged,
+                                playheadMs = previewAtMs,
+                                onSeek = ::seekPreview,
                                 targetAspect = targetAspect,
                                 inputFps = inputFps,
                                 targetW = targetW,
@@ -2509,8 +2476,26 @@ class MainActivity : ComponentActivity() {
         stopVoicePlayback()
         // Before the preview's own teardown: the pump holds the pipeline this is about to
         // release, and stop() is what makes it let go.
-        player.stop()
-        previews.release()
+        val wasPlaying = playerOpen && player.active
+        playerOpen = false
+        val ownedSequence = lastPipeSeq
+        CoroutineScope(Dispatchers.IO).launch {
+            player.stop()
+            if (wasPlaying && PipeGuard.holder == "player") {
+                NativePipe.release()
+                PipeGuard.release()
+            }
+            previews.closeTarget()
+            // A cancelled coroutine can still be returning from a blocking JNI call.
+            // Release only after it has yielded the singleton and no new owner has used it.
+            if (PipeGuard.acquire("preview teardown", 5000)) {
+                try {
+                    if (PipeGuard.uninterrupted(ownedSequence)) previews.invalidate()
+                } finally {
+                    PipeGuard.release()
+                }
+            }
+        }
     }
 
     private fun fmt(ms: Float): String {
@@ -3090,10 +3075,11 @@ class MainActivity : ComponentActivity() {
      * refresh still lands, rather than being dropped by refreshSwapped's early return.
      */
     private fun previewOptionsChanged(hard: Boolean = false, reloads: Boolean = true) {
+        previewSettingsRevision++
         // `hard` is for a model that went away underneath the loaded pipeline. Still not
         // while a swap is reading it: the redraw below re-checks the files and reports the
         // missing one, which is the useful half of tearing it down anyway.
-        if (hard && !previewBusy) previews.invalidate()
+        if (hard && !previewBusy && PipeGuard.holder == null) previews.invalidate()
         // Cold only when the pipeline really has to be rebuilt. `reloads` is false for a
         // per-frame option, whose new value refreshSwapped pushes to the warm pipeline --
         // going cold there would re-decode the source and re-run the gate to change a float.
@@ -3110,33 +3096,34 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * The trim handle moved.
-     *
-     * Debounced rather than acted on per pixel: a drag emits dozens of values a second and
-     * each one is a video seek. The swapped pane waits longer again, and only refreshes if
-     * the pipeline is ALREADY warm -- the first load costs seconds and must be asked for.
-     */
     private fun onTrimChanged(start: Float, end: Float, edge: TrimEdge) {
-        trimStartMs = start
-        trimEndMs = end
-        previewEdge = edge
+        timeline = timeline.trim(start, end, edge == TrimEdge.Start)
+    }
+
+    private fun resetSeek(duration: Long = 0L) {
         scrubJob?.cancel()
+        previewRevision++
+        seekingPreview = false
+        timeline = VideoTimeline(duration)
+    }
+
+    private fun seekPreview(position: Float) {
+        val next = timeline.seek(position)
+        if (next == timeline) return
+        timeline = next
+        val revision = ++previewRevision
+        seekingPreview = true
+        scrubJob?.cancel()
+        clearPreviewFrames()
+        originalFrame = null
         scrubJob = lifecycleScope.launch {
-            delay(150)
-            // The frame under the handle being dragged, not always the start.
-            android.util.Log.d("ffpreview", "seek to " + previewAtMs + " edge=" + edge)
-            val got = previews.frameAt(previewAtMs)
-            // Size only. The pixel sampling that lived here is what proved the retriever was
-            // returning identical images for different timestamps (see FrameSeeker); it did
-            // its job and does not belong in a shipping build.
-            android.util.Log.d("ffpreview", "  frame=" +
-                (if (got == null) "NULL" else got.width.toString() + "x" + got.height))
-            originalFrame = got
-            if (previewWarm && !busy) {
-                delay(250)
-                refreshSwapped(force = false)
-            }
+            delay(120)
+            val frame = previews.frameAt(next.positionMs)
+            if (revision != previewRevision) return@launch
+            originalFrame = frame
+            seekingPreview = false
+            if (frame == null) previewNote = getString(R.string.status_cannot_read_frame)
+            else refreshSwapped(force = true)
         }
     }
 
@@ -3163,7 +3150,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun refreshSwapped(force: Boolean) {
-        if (busy) { skipRefresh("a run owns the pipeline"); return }
+        if (seekingPreview) return
+        if (busy || preparing) { skipRefresh("a run owns the pipeline"); return }
         // Coalesced, not dropped: remember that the pane is out of date and redraw once the
         // in-flight one lets go. `force` is OR-ed in so a cold request cannot be downgraded
         // by a warm one arriving behind it.
@@ -3174,60 +3162,72 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (!previewWarm && !force) { skipRefresh("cold and not forced"); return }
-        if (opts.swapsFace && sourceUri == null) { skipRefresh("no source"); return }
+        val discoveryOnly = opts.swapsFace && sourceUri == null
         // An image target has no targetFile -- it is held as a bitmap. Testing the
         // video handle here meant an image never previewed at all.
         if (targetFile == null && targetImage == null) { skipRefresh("no target"); return }
         android.util.Log.d("ffpreview", "refresh start force=" + force + " warm=" + previewWarm)
 
+        val revision = previewRevision
+        val atMs = previewAtMs
+        val settingsRevision = previewSettingsRevision
+        previewBusy = true
         lifecycleScope.launch {
             // The API server may be mid-request. Wait briefly rather than bounce: a preview
             // that quietly does not appear is the bug this whole pass has been about.
-            if (!PipeGuard.acquire("preview", 4000)) {
-                previewNote = pipeBusyMessage()
-                return@launch
-            }
-            // Someone else has had the pipeline since this screen last used it, so the warm
-            // flag describes their source, not ours.
-            if (!PipeGuard.uninterrupted(lastPipeSeq)) {
-                previews.invalidate()
-                previewWarm = false
-            }
-            lastPipeSeq = PipeGuard.sequence
-
-            previewBusy = true
-            previewNote = null
-            // Per-frame options onto the WARM pipeline, before the frame is swapped with
-            // them. No-ops when nothing is loaded or nothing changed; when the swapper
-            // changed it does nothing and ensureReady below does the reload instead.
-            previews.applyOptions(opts)
-            // Same reasoning, for the lip syncer's driving audio -- decoded once per voice
-            // file (see PreviewEngine.applyVoice), called on every refresh rather than only
-            // at cold warm-up so a voice picked or changed AFTER the preview is already
-            // warm still reaches it. The fps has to match what a real run would index
-            // frames at, or the preview and the eventual output disagree on which mouth
-            // belongs to which timestamp.
-            if (opts.lipSync) {
-                val previewFps = if (opts.outputFps in 1..inputFps) opts.outputFps else inputFps
-                // The SAME trim the run will use: the preview's mel windows must index the
-                // same part of the voice the output does, or the scrubbed mouth and the
-                // rendered mouth would disagree on every frame.
-                previews.applyVoice(voiceFile?.absolutePath,
-                                    (voiceTrimStartMs * 1000).toLong(),
-                                    if (voiceTrimEndMs >= voiceDurationMs) Long.MAX_VALUE
-                                    else (voiceTrimEndMs * 1000).toLong(),
-                                    previewFps.toDouble())
-            }
+            var acquired = false
             try {
-                val frame = originalFrame ?: previews.frameAt(previewAtMs)?.also {
+                acquired = acquireUiPipe("preview", 4000)
+                if (!acquired) {
+                    if (revision == previewRevision) previewNote = pipeBusyMessage()
+                    return@launch
+                }
+                if (revision != previewRevision || settingsRevision != previewSettingsRevision ||
+                    seekingPreview || busy || preparing) {
+                    if (PipeGuard.uninterrupted(lastPipeSeq)) lastPipeSeq = PipeGuard.sequence
+                    return@launch
+                }
+                // Someone else has had the pipeline since this screen last used it, so the warm
+                // flag describes their source, not ours.
+                if (!PipeGuard.uninterrupted(lastPipeSeq)) {
+                    previews.invalidate()
+                    previewWarm = false
+                }
+                lastPipeSeq = PipeGuard.sequence
+
+                previewNote = null
+                // Per-frame options onto the WARM pipeline, before the frame is swapped with
+                // them. No-ops when nothing is loaded or nothing changed; when the swapper
+                // changed it does nothing and ensureReady below does the reload instead.
+                previews.applyOptions(opts)
+                // Same reasoning, for the lip syncer's driving audio -- decoded once per voice
+                // file (see PreviewEngine.applyVoice), called on every refresh rather than only
+                // at cold warm-up so a voice picked or changed AFTER the preview is already
+                // warm still reaches it. The fps has to match what a real run would index
+                // frames at, or the preview and the eventual output disagree on which mouth
+                // belongs to which timestamp.
+                if (opts.lipSync) {
+                    val previewFps = if (opts.outputFps in 1..inputFps) opts.outputFps else inputFps
+                    // The SAME trim the run will use: the preview's mel windows must index the
+                    // same part of the voice the output does, or the scrubbed mouth and the
+                    // rendered mouth would disagree on every frame.
+                    previews.applyVoice(voiceFile?.absolutePath,
+                                        (voiceTrimStartMs * 1000).toLong(),
+                                        if (voiceTrimEndMs >= voiceDurationMs) Long.MAX_VALUE
+                                        else (voiceTrimEndMs * 1000).toLong(),
+                                        previewFps.toDouble())
+                }
+                val frame = originalFrame ?: previews.frameAt(atMs)?.also {
+                    if (revision != previewRevision) return@launch
                     originalFrame = it
                 } ?: run {
                     previewNote = getString(R.string.status_cannot_read_frame)
                     return@launch
                 }
 
-                if (!previewWarm) {
-                    val prepared = withContext(Dispatchers.IO) { prepareSources() }
+                if (!previewWarm || (opts.swapsFace && !discoveryOnly && !previews.hasRegisteredSource)) {
+                    val prepared = if (discoveryOnly) PreparedSources(emptyList(), emptyList())
+                                   else withContext(Dispatchers.IO) { prepareSources() }
                     if (prepared == null) {
                         previewNote = getString(R.string.status_cannot_read_source)
                         return@launch
@@ -3247,7 +3247,7 @@ class MainActivity : ComponentActivity() {
                         lib, models.absolutePath, opts,
                         slots = prepared.slots,
                         activeSource = swapSourceIndex,
-                        assignEnabled = swapAssignMode,
+                        discoveryOnly = discoveryOnly,
                         // The same check runSwap makes, over the same list. Without it the
                         // preview is a complete second processing path with no check on
                         // it, and the check becomes avoidable by never pressing Swap.
@@ -3268,20 +3268,19 @@ class MainActivity : ComponentActivity() {
                         return@launch
                     }
                     previewWarm = true
-                    // ⚠ AFTER the init, every time. Native assignments live on the
-                    // pipeline and do not survive one being built, so a mode that is on
-                    // would come back empty and silently swap everybody.
-                    restoreSwapAssignments()
-                    // Same for the lips list: Kotlin state is the truth, pushed
-                    // exactly (rotation, concurrent re-warm and restores cannot
-                    // drift it from what the green boxes show).
+                    // Restore the separate lip selection after model initialization.
                     pushLipSelection()
                 }
+
+                if (revision != previewRevision || settingsRevision != previewSettingsRevision || discoveryOnly) return@launch
 
                 // Every previewed frame, not just the source. The source is checked once,
                 // when the pipeline warms; the target is checked here because the trim
                 // handle can reach any frame in the clip and this pane displays it.
-                ContentGate.inspectStill(frame, R.string.gate_subject_this_frame).let { v ->
+                withContext(Dispatchers.Default) {
+                    ContentGate.inspectStill(frame, R.string.gate_subject_this_frame)
+                }.let { v ->
+                    if (revision != previewRevision) return@launch
                     if (!v.permitted) {
                         // Logged with its subject, like every other check: a report that
                         // shows only the SOURCE score passing cannot say this was the
@@ -3294,7 +3293,10 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                val out = previews.swap(frame, previewAtMs, voiceFile?.absolutePath)
+                NativePipe.setActiveSource(swapSourceIndex)
+                val withAssignments = configureMediaAssignments(targetImage != null, sequential = false)
+                val out = previews.swap(frame, atMs, voiceFile?.absolutePath, withAssignments)
+                if (revision != previewRevision || settingsRevision != previewSettingsRevision) return@launch
                 android.util.Log.d("ffpreview", "  swapped faces=" + out.faces +
                                                 " err=" + out.error)
                 when {
@@ -3313,9 +3315,13 @@ class MainActivity : ComponentActivity() {
                         if (targetImage != null) { savedUri = null; savedPathLabel = null }
                     }
                 }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                if (revision == previewRevision) previewNote = e.message
             } finally {
                 previewBusy = false
-                PipeGuard.release()
+                if (acquired) PipeGuard.release()
                 // Whatever arrived while this one held the pipeline. Reads the CURRENT
                 // position rather than a remembered one -- the seek job keeps
                 // `originalFrame` up to date, so the redraw lands on the newest frame
@@ -3461,13 +3467,14 @@ class MainActivity : ComponentActivity() {
                 // new clip applies a decision nobody made about it. Reset, not remembered.
                 if (opts.outputFps != 0 || opts.outputMaxShortEdge != 0)
                     applyOpts(opts.copy(outputFps = 0, outputMaxShortEdge = 0))
-                trimStartMs = 0f; trimEndMs = l.durationMs.toFloat()
+                resetSeek(l.durationMs)
                 targetAspect = if (l.width > 0 && l.height > 0)
                     l.width.toFloat() / l.height else 16f / 9f
                 status = getString(R.string.status_target_ready_video,
                                    l.width, l.height, fmt(l.durationMs.toFloat()))
                 // Open it for scrubbing and show the first frame straight away.
-                previews.openTarget(l.file.absolutePath, l.fps)
+                targetCloseJob?.join()
+                withContext(Dispatchers.IO) { previews.openTarget(l.file.absolutePath, l.fps) }
                 targetVersion++
                 // `preview` too, which this path used to leave set -- see clearPreviewFrames.
                 clearPreviewFrames()
@@ -3493,18 +3500,32 @@ class MainActivity : ComponentActivity() {
         preparing = true
         targetName = displayName(uri)
         lifecycleScope.launch {
-            val bmp = withContext(Dispatchers.IO) { decodeOriented(uri, MAX_TARGET_EDGE) }
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+                    val pixelLimit = minOf(24_000_000L, am.largeMemoryClass * 1024L * 1024 / 32)
+                    ImageDecoder.decodeBitmap(ImageDecoder.createSource(contentResolver, uri)) { d, info, _ ->
+                        check(info.size.width.toLong() * info.size.height <= pixelLimit) {
+                            getString(R.string.swap_photo_too_large, pixelLimit / 1_000_000)
+                        }
+                        d.allocator = ImageDecoder.ALLOCATOR_SOFTWARE
+                        d.isMutableRequired = true
+                    }
+                }
+            }
+            val bmp = result.getOrNull()
             if (bmp == null) {
-                status = getString(R.string.status_cannot_read_image)
+                status = result.exceptionOrNull()?.message ?: getString(R.string.status_cannot_read_image)
                 preparing = false
                 return@launch
             }
             discardOutput()
-            previews.closeTarget()
+            targetCloseJob?.join()
+            withContext(Dispatchers.IO) { previews.closeTarget() }
             targetFile = null
             targetImage = bmp
             durationMs = 0L
-            trimStartMs = 0f; trimEndMs = 0f
+            resetSeek()
             targetAspect = if (bmp.height > 0) bmp.width.toFloat() / bmp.height else 1f
             // The frames, not the pipeline. The double `originalFrame = bmp` this replaces
             // was working around invalidatePreview clearing state this path had just set.
@@ -3720,8 +3741,11 @@ class MainActivity : ComponentActivity() {
         val y0 = box[1].toInt().coerceIn(0, frame.height - 1)
         val x1 = box[2].toInt().coerceIn(x0 + 1, frame.width)
         val y1 = box[3].toInt().coerceIn(y0 + 1, frame.height)
-        Bitmap.createScaledBitmap(
-            Bitmap.createBitmap(frame, x0, y0, x1 - x0, y1 - y0), 96, 96, true)
+        val thumb = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888)
+        android.graphics.Canvas(thumb).drawBitmap(
+            frame, android.graphics.Rect(x0, y0, x1, y1), android.graphics.Rect(0, 0, 96, 96),
+            android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
+        thumb
     }.getOrNull()
 
     /** Release the player entirely -- a new voice is loaded, or the screen is going away. */
@@ -3871,16 +3895,16 @@ class MainActivity : ComponentActivity() {
         // the visible clip goes away would leave a run that starts on a clip nothing on
         // screen mentions.
         batchQueue = emptyList()
-        previews.closeTarget()
+        targetCloseJob = lifecycleScope.launch(Dispatchers.IO) { previews.closeTarget() }
         targetFile = null
         targetImage = null
         targetName = null
         durationMs = 0L
-        trimStartMs = 0f; trimEndMs = 0f
+        resetSeek()
         targetAspect = 16f / 9f
         originalFrame = null
         targetVersion++
-        invalidatePreview()
+        clearPreviewFrames()
         status = ""
     }
 
@@ -4320,7 +4344,7 @@ class MainActivity : ComponentActivity() {
         // Read at bind time by the engine, so it must be set before start() and not after.
         live.frontCamera = liveFrontCamera
         lifecycleScope.launch {
-            if (!PipeGuard.acquire("live", 5000)) {
+            if (!acquireUiPipe("live", 5000)) {
                 liveNote = pipeBusyMessage(); return@launch
             }
             // The preview holds a warm pipeline configured for the Swap screen. Live needs
@@ -4553,7 +4577,7 @@ class MainActivity : ComponentActivity() {
         if (sources.isEmpty()) return
         val tgt = targetFile ?: return
         lifecycleScope.launch {
-            if (!PipeGuard.acquire("player", 5000)) {
+            if (!acquireUiPipe("player", 5000)) {
                 status = pipeBusyMessage(); return@launch
             }
             // The preview holds a warm pipeline configured for the Swap screen. The player
@@ -4598,7 +4622,7 @@ class MainActivity : ComponentActivity() {
                 }
 
                 registerSources(prepared)?.let { return@withContext it }
-                restoreSwapAssignments()
+                configureMediaAssignments(still = false, sequential = false)
                 null
             }
             if (err != null) {
@@ -4609,7 +4633,7 @@ class MainActivity : ComponentActivity() {
                 status = getString(R.string.status_failed, err)
                 return@launch
             }
-            player.start(tgt.absolutePath) { shot ->
+            player.start(tgt.absolutePath, swapAssignMode && opts.swapsFace) { shot ->
                 // The pump thread writes snapshot state directly, which is what
                 // LiveEngine's analyzer thread does and is safe for the same reason.
                 //
@@ -4657,13 +4681,16 @@ class MainActivity : ComponentActivity() {
     private fun runSwap() {
         if (opts.swapsFace && sourceUri == null) return
         val tgt = targetFile ?: return
+        if (swapAssignMode && peopleScanning) {
+            status = getString(R.string.swap_discovering_people)
+            return
+        }
         // Defence in depth: the Swap button in SwapScreen is already disabled without one
         // when Lip Sync is on, but this is the actual place a no-op run would happen, so it
         // is checked again here rather than trusted from the UI alone.
         if (opts.lipSync && voiceFile == null) return
         // The preview holds a loaded pipeline and `g_pipe` is a single global, so the run
         // cannot start until it lets go.
-        invalidatePreview()
         cancelRequested = false
         busy = true; progress = 0f; log = ""
         // Deletes the PREVIOUS run's file, not merely the reference to it.
@@ -4673,11 +4700,12 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             // The run owns the pipeline for its whole length, minutes on a long clip. The
             // API server gets 503 for the duration, which is the honest answer.
-            if (!PipeGuard.acquire("swap", 5000)) {
+            if (!acquireUiPipe("swap", 5000)) {
                 status = pipeBusyMessage()
                 busy = false
                 return@launch
             }
+            invalidatePreview()
             // Promote this process to the foreground for the duration of the swap so
             // locking the screen or switching apps does not get a multi-minute Dimensity
             // video swap killed. (Photo swaps are seconds but showing the same progress
@@ -4747,7 +4775,8 @@ class MainActivity : ComponentActivity() {
                     // ⚠ This init built a fresh pipeline, so every per-person choice the
                     // user made against the PREVIEW is gone from it. Without this the mode
                     // would work perfectly on screen and do nothing in the file.
-                    val restored = restoreSwapAssignments()
+                    val withAssignments = configureMediaAssignments(still = false, sequential = true)
+                    val restored = if (withAssignments) swapPersonAssignments.values.count { it >= 0 } else 0
                     // Same for the lips targets: N faces when set, all faces when not.
                     // Logged so a run that syncs everyone says whether it had a choice.
                     val lipsN = pushLipSelection()
@@ -4779,14 +4808,14 @@ class MainActivity : ComponentActivity() {
                         outputFps = opts.outputFps,
                         outputMaxShortEdge = opts.outputMaxShortEdge,
                         trackPeriod = opts.trackPeriod,
+                        mediaAssignments = withAssignments,
                         lipSync = opts.lipSync,
                         voicePath = voiceFile?.absolutePath,
                         voiceTrimStartUs = (voiceTrimStartMs * 1000).toLong(),
                         voiceTrimEndUs = if (voiceTrimEndMs >= voiceDurationMs) Long.MAX_VALUE
                                          else (voiceTrimEndMs * 1000).toLong(),
-                        trimStartUs = (trimStartMs * 1000).toLong(),
-                        trimEndUs = if (trimEndMs >= durationMs) Long.MAX_VALUE
-                                    else (trimEndMs * 1000).toLong(),
+                        trimStartUs = timeline.startUs,
+                        trimEndUs = timeline.endUs,
                         onProgress = { done, total ->
                             val now = System.currentTimeMillis()
                             if (now - lastProgress >= 100 || done >= total) {
@@ -4878,16 +4907,16 @@ class MainActivity : ComponentActivity() {
         if (animate && driver == null) return
         if (opts.lipSync && voiceFile == null) return
         if (!animate && !opts.lipSync) return
-        invalidatePreview()
         cancelRequested = false
         busy = true; progress = 0f; log = ""
         discardOutput()
         preview = null; framesDone = 0; framesTotal = 0; elapsedS = 0.0
 
         lifecycleScope.launch {
-            if (!PipeGuard.acquire("swap", 5000)) {
+            if (!acquireUiPipe("swap", 5000)) {
                 status = pipeBusyMessage(); busy = false; return@launch
             }
+            invalidatePreview()
             val result = withContext(Dispatchers.Default) {
                 runCatching {
                     val models = modelDir()
@@ -5016,7 +5045,6 @@ class MainActivity : ComponentActivity() {
         if (opts.swapsFace && src == null) return
         val first = targetFile ?: return
         if (opts.lipSync && voiceFile == null) return
-        invalidatePreview()
         cancelRequested = false
         busy = true; progress = 0f; log = ""
         discardOutput()
@@ -5044,11 +5072,12 @@ class MainActivity : ComponentActivity() {
         BatchService.start(this)
 
         lifecycleScope.launch {
-            if (!PipeGuard.acquire("batch", 5000)) {
+            if (!acquireUiPipe("batch", 5000)) {
                 status = pipeBusyMessage(); busy = false
                 BatchStatus.end(); BatchService.stop(this@MainActivity)
                 return@launch
             }
+            invalidatePreview()
             // ⚠ try/finally around EVERYTHING after the acquire, for the same reason
             // DownloadService wraps its whole run. This coroutine lives in lifecycleScope,
             // so the Activity going away CANCELS it mid-clip -- and without this the

@@ -630,6 +630,56 @@ Java_com_facefusion_mobile_NativePipe_detectFaces(JNIEnv* env, jclass, jbyteArra
   return out;
 }
 
+static std::vector<ffmedia::Face> readMediaGallery(JNIEnv* env, jfloatArray input) {
+  const auto size = env->GetArrayLength(input);
+  if (size % ffmedia::kRecordSize != 0 || size > ffmedia::kMaxPeople * ffmedia::kRecordSize)
+    return {};
+  std::vector<ffmedia::Face> people(size / ffmedia::kRecordSize);
+  for (size_t i = 0; i < people.size(); ++i) {
+    const jsize offset = (jsize)i * ffmedia::kRecordSize;
+    env->GetFloatArrayRegion(input, offset, 4, people[i].box.data());
+    env->GetFloatArrayRegion(input, offset + 4, ffmedia::kEmbeddingSize,
+                            people[i].embedding.data());
+  }
+  return people;
+}
+
+JNIEXPORT jfloatArray JNICALL
+Java_com_facefusion_mobile_NativePipe_discoverMediaFaces(JNIEnv* env, jclass, jbyteArray bgr,
+    jint w, jint h, jfloatArray gallery) {
+  if (!g_pipe || w <= 0 || h <= 0 || (int64_t)w * h * 3 != env->GetArrayLength(bgr))
+    return env->NewFloatArray(0);
+  ffcv::Image image(w, h, 3);
+  env->GetByteArrayRegion(bgr, 0, (jsize)image.data.size(), (jbyte*)image.data.data());
+  const auto faces = g_pipe->mediaFaces(g_pipe->analyse(image, false, true), w, h);
+  ffmedia::Matcher matcher(readMediaGallery(env, gallery));
+  const auto matches = matcher.match(faces, false, false, 0.24f);
+  std::vector<float> flat;
+  flat.reserve(faces.size() * (ffmedia::kRecordSize + 1));
+  for (size_t i = 0; i < faces.size(); ++i) {
+    const auto& f = faces[i];
+    flat.insert(flat.end(), f.box.begin(), f.box.end());
+    flat.insert(flat.end(), f.embedding.begin(), f.embedding.end());
+    flat.push_back((float)matches[i]);
+  }
+  jfloatArray out = env->NewFloatArray((jsize)flat.size());
+  if (out && !flat.empty()) env->SetFloatArrayRegion(out, 0, (jsize)flat.size(), flat.data());
+  return out;
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_facefusion_mobile_NativePipe_setMediaAssignments(JNIEnv* env, jclass,
+    jfloatArray gallery, jintArray sources, jboolean still, jboolean sequential) {
+  if (!g_pipe) return JNI_FALSE;
+  auto people = readMediaGallery(env, gallery);
+  if (env->GetArrayLength(gallery) != (jsize)people.size() * ffmedia::kRecordSize ||
+      env->GetArrayLength(sources) != (jsize)people.size()) return JNI_FALSE;
+  std::vector<int> slots(people.size());
+  if (!slots.empty()) env->GetIntArrayRegion(sources, 0, (jsize)slots.size(), slots.data());
+  g_pipe->setMediaAssignments(std::move(people), std::move(slots), still, sequential);
+  return JNI_TRUE;
+}
+
 // Point at a face and swap only that one -- upstream's face_selector_mode = reference.
 //
 // Returns the chosen face's box as four floats, or an EMPTY array when the point was not
@@ -1200,13 +1250,17 @@ Java_com_facefusion_mobile_NativePipe_melWindowTotal(JNIEnv*, jclass) {
  * device, or audio that was never set all fall back to a plain swap, so a caller may use
  * this unconditionally.
  */
-JNIEXPORT jint JNICALL
-Java_com_facefusion_mobile_NativePipe_processFrameAt(JNIEnv* env, jclass, jbyteArray jBgr,
-                                                     jint w, jint h, jint frameIndex) {
+static jint processFrameAt(JNIEnv* env, jbyteArray jBgr, jint w, jint h, jint frameIndex,
+                           bool media) {
   if (!g_pipe) { g_err = "pipeline not initialised"; return -1; }
   ffcv::Image img(w, h, 3);
   env->GetByteArrayRegion(jBgr, 0, (jsize)img.data.size(), (jbyte*)img.data.data());
-  auto faces = g_pipe->analyse(img);
+  auto faces = g_pipe->analyse(img, false, media);
+  struct MediaFrameScope {
+    ffpipe::Pipeline* pipe;
+    ~MediaFrameScope() { if (pipe) pipe->endMediaFrame(); }
+  } scope{media ? g_pipe.get() : nullptr};
+  if (scope.pipe) scope.pipe->beginMediaFrame(faces, w, h);
   if (!faces.empty()) {
     if (!g_pipe->swapAll(img, faces)) { g_err = g_pipe->error(); return -1; }
     // The editor before the lip syncer and the enhancer, which then work on the edited face.
@@ -1224,6 +1278,18 @@ Java_com_facefusion_mobile_NativePipe_processFrameAt(JNIEnv* env, jclass, jbyteA
     env->SetByteArrayRegion(jBgr, 0, (jsize)img.data.size(), (const jbyte*)img.data.data());
   }
   return (jint)faces.size();
+}
+
+JNIEXPORT jint JNICALL
+Java_com_facefusion_mobile_NativePipe_processFrameAt(JNIEnv* env, jclass, jbyteArray bgr,
+    jint w, jint h, jint frameIndex) {
+  return processFrameAt(env, bgr, w, h, frameIndex, false);
+}
+
+JNIEXPORT jint JNICALL
+Java_com_facefusion_mobile_NativePipe_processMediaFrameAt(JNIEnv* env, jclass, jbyteArray bgr,
+    jint w, jint h, jint frameIndex) {
+  return processFrameAt(env, bgr, w, h, frameIndex, true);
 }
 
 /**
