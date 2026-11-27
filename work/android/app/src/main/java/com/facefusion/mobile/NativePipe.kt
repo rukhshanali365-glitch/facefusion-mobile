@@ -337,11 +337,11 @@ object NativePipe {
                                       dw: Int, dh: Int): ByteArray?
 
     @JvmStatic external fun discoverMediaFaces(
-        bgr: ByteArray, w: Int, h: Int, gallery: FloatArray,
+        bgr: ByteArray, w: Int, h: Int, gallery: FloatArray, owners: IntArray, still: Boolean,
     ): FloatArray
 
     @JvmStatic external fun setMediaAssignments(
-        gallery: FloatArray, sources: IntArray, still: Boolean, sequential: Boolean,
+        gallery: FloatArray, owners: IntArray, sources: IntArray, still: Boolean, sequential: Boolean,
     ): Boolean
 
     @JvmStatic external fun processMediaFrameAt(

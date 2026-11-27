@@ -240,9 +240,8 @@ class Pipeline {
   std::vector<Face> analyse(const ffcv::Image& frame, bool boxesOnly = false,
                             bool noTrack = false);
 
-  // The source identity: the largest face of the source image, embedding only.
   std::vector<ffmedia::Face> mediaFaces(const std::vector<Face>& faces, int w, int h) const;
-  void setMediaAssignments(std::vector<ffmedia::Face> people, std::vector<int> slots,
+  void setMediaAssignments(ffmedia::Gallery people, std::vector<int> slots,
                            bool still, bool sequential);
   void beginMediaFrame(const std::vector<Face>& faces, int w, int h);
   void endMediaFrame();

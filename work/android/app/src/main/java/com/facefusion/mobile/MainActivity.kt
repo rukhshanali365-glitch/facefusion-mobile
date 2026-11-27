@@ -91,10 +91,9 @@ class MainActivity : ComponentActivity() {
     private var swapBrushKeepOriginal by mutableStateOf(false)
     private var swapSelectedPerson by mutableIntStateOf(-1)
     private var mediaPeople = MediaPeople<Bitmap>()
-    private var swapPersonThumbs by mutableStateOf<List<Bitmap>>(emptyList())
-    private var peopleScanning by mutableStateOf(false)
-    private var peopleScanned = false
-    private var swapPersonAssignments by mutableStateOf<Map<Int, Int>>(emptyMap())
+    private var visiblePeople by mutableStateOf(MediaPeople.Frame<Bitmap>(-1))
+    private var assignedPeople by mutableStateOf<List<MediaFace<Bitmap>>>(emptyList())
+    private var detectingPeople by mutableStateOf(false)
     private var liveLargestOnly by mutableStateOf(false)
     private var targetFile by mutableStateOf<File?>(null)
     private var targetName by mutableStateOf<String?>(null)
@@ -595,7 +594,7 @@ class MainActivity : ComponentActivity() {
     private val previewAtMs get() = timeline.positionMs
     private var previewRevision = 0L
     private var previewSettingsRevision = 0L
-    private var seekingPreview = false
+    private var seekingPreview by mutableStateOf(false)
     private var scrubJob: Job? = null
     private var targetCloseJob: Job? = null
 
@@ -851,13 +850,9 @@ class MainActivity : ComponentActivity() {
             }
         }
         sources = sources.filterIndexed { i, _ -> i != index }
-        swapPersonAssignments = swapPersonAssignments.mapNotNull { (person, slot) ->
-            when {
-                slot == index -> null
-                slot > index -> person to (slot - 1)
-                else -> person to slot
-            }
-        }.toMap()
+        mediaPeople.removeSource(index)
+        swapSelectedPerson = -1
+        updateFaceRows()
         fun shift(i: Int) = (if (i > index) i - 1 else i)
             .coerceIn(0, sources.lastIndex.coerceAtLeast(0))
         swapSourceIndex = shift(swapSourceIndex)
@@ -949,39 +944,56 @@ class MainActivity : ComponentActivity() {
         swapSelectedPerson = -1
         swapBrushKeepOriginal = false
         mediaPeople = MediaPeople()
-        swapPersonThumbs = emptyList()
-        swapPersonAssignments = emptyMap()
-        peopleScanned = false
+        updateFaceRows()
+    }
+
+    private fun updateFaceRows() {
+        visiblePeople = mediaPeople.visible()
+        assignedPeople = mediaPeople.assigned()
     }
 
     private fun selectSwapSource(index: Int) {
         if (index !in sources.indices) return
         swapBrushKeepOriginal = false
         swapSourceIndex = index
-        if (swapAssignMode && swapSelectedPerson >= 0)
-            assignSwapPerson(swapSelectedPerson, index)
-        else previewOptionsChanged(reloads = false)
+        if (swapSelectedPerson >= 0 && mediaPeople.assignKnown(swapSelectedPerson, index)) {
+            swapAssignMode = true
+            updateFaceRows()
+        }
+        previewOptionsChanged(reloads = false)
     }
 
     private fun selectSwapKeepOriginal() {
         swapBrushKeepOriginal = true
-        if (swapSelectedPerson >= 0) assignSwapPerson(swapSelectedPerson, KEEP_ORIGINAL)
+        if (swapSelectedPerson >= 0 &&
+            mediaPeople.assignKnown(swapSelectedPerson, KEEP_ORIGINAL)) {
+            swapSelectedPerson = -1
+            updateFaceRows()
+            previewOptionsChanged(reloads = false)
+        }
     }
 
-    private fun assignSwapPerson(person: Int, source: Int) {
-        if (!swapAssignMode || person !in swapPersonThumbs.indices) return
-        if (source != KEEP_ORIGINAL && source !in sources.indices) return
-        swapPersonAssignments = swapPersonAssignments + (person to source)
-        status = if (source == KEEP_ORIGINAL) getString(R.string.swap_assign_kept, person + 1)
-                 else getString(R.string.swap_assign_set, person + 1, source + 1)
+    private fun selectSwapPerson(revision: Long, index: Int) {
+        if (revision != previewRevision || seekingPreview || sources.isEmpty()) return
+        if (swapBrushKeepOriginal) {
+            val visible = visiblePeople.faces.getOrNull(index) ?: return
+            swapSelectedPerson = visible.person ?: return
+            selectSwapKeepOriginal()
+            return
+        }
+        val person = mediaPeople.assignVisible(revision, index, swapSourceIndex) ?: return
+        swapSelectedPerson = person
+        swapAssignMode = true
+        updateFaceRows()
+        status = getString(R.string.swap_assign_set, person + 1, swapSourceIndex + 1)
         previewOptionsChanged(reloads = false)
     }
 
-    private fun selectSwapPerson(person: Int) {
-        if (person !in swapPersonThumbs.indices || sources.isEmpty()) return
+    private fun selectAssignedPerson(person: Int) {
+        val selected = assignedPeople.firstOrNull { it.person == person } ?: return
         swapSelectedPerson = person
-        swapAssignMode = true
-        assignSwapPerson(person, if (swapBrushKeepOriginal) KEEP_ORIGINAL else swapSourceIndex)
+        if (swapAssignMode) swapSourceIndex = selected.source ?: return
+        swapBrushKeepOriginal = false
     }
 
     private fun toggleSwapAssign() {
@@ -992,9 +1004,10 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun clearSwapAssignments() {
-        swapPersonAssignments = emptyMap()
+        mediaPeople.clearAssignments()
         swapSelectedPerson = -1
         swapBrushKeepOriginal = false
+        updateFaceRows()
         status = getString(R.string.swap_assign_cleared)
         previewOptionsChanged(reloads = false)
     }
@@ -1008,84 +1021,37 @@ class MainActivity : ComponentActivity() {
         return true
     }
 
-    private suspend fun discoverPeople(frame: Bitmap, version: Int): Boolean {
-        while (!PipeGuard.acquire("face discovery")) {
-            if (version != targetVersion || busy || preparing) return false
-            delay(30)
-        }
+    // Called while the preview owns PipeGuard, after its existing content check.
+    private suspend fun detectPreviewPeople(frame: Bitmap, revision: Long, still: Boolean) {
         val catalog = mediaPeople
-        val found = try {
-            if (!PipeGuard.uninterrupted(lastPipeSeq)) {
-                lastPipeSeq = 0
-                return false
-            }
-            lastPipeSeq = PipeGuard.sequence
-            withContext(Dispatchers.Default) {
-                val verdict = ContentGate.inspectStill(frame, R.string.gate_subject_this_frame)
-                if (!verdict.permitted) return@withContext FloatArray(0)
-                val soft = frame.asArgb8888() ?: return@withContext FloatArray(0)
+        if (catalog.frameAnalyzed) return
+        val gallery = catalog.gallery()
+        detectingPeople = true
+        try {
+            val found = withContext(Dispatchers.Default) {
+                val soft = frame.asArgb8888()
                 val pixels = IntArray(soft.width * soft.height)
                 soft.getPixels(pixels, 0, soft.width, 0, 0, soft.width, soft.height)
                 NativePipe.discoverMediaFaces(
-                    NativePipe.argbToBgr(pixels, soft.width, soft.height),
-                    soft.width, soft.height, catalog.gallery())
+                    NativePipe.argbToBgr(pixels, soft.width, soft.height), soft.width,
+                    soft.height, gallery.records, gallery.owners, still)
             }
-        } finally {
-            PipeGuard.release()
-            if (lastPipeSeq == 0) refreshSwapped(force = true)
-        }
-        if (version != targetVersion || catalog !== mediaPeople) return false
-        catalog.add(found) { record ->
-            cropPersonThumb(frame, listOf(record[0] * frame.width, record[1] * frame.height,
-                record[2] * frame.width, record[3] * frame.height))
-        }
-        swapPersonThumbs = catalog.thumbnails()
-        return true
-    }
-
-    private suspend fun scanTargetPeople() {
-        val version = targetVersion
-        peopleScanning = true
-        try {
-            val photo = targetImage
-            val video = targetFile
-            peopleScanned = when {
-                photo != null -> discoverPeople(photo, version)
-                video != null -> withContext(Dispatchers.IO) {
-                    val decoder = FrameSeeker.open(video.absolutePath) ?: return@withContext true
-                    decoder.use {
-                        it.scanFrames(500_000L) { bgr ->
-                            val width = it.outWidth
-                            val height = it.outHeight
-                            val scale = minOf(1f, 1280f / maxOf(width, height))
-                            val w = (width * scale).toInt().coerceAtLeast(1)
-                            val h = (height * scale).toInt().coerceAtLeast(1)
-                            val pixels = NativePipe.bgrToArgb(bgr, width, height, w, h)
-                            val bitmap = Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
-                            try {
-                                withContext(Dispatchers.Main) { discoverPeople(bitmap, version) }
-                            } finally {
-                                bitmap.recycle()
-                            }
-                        }
-                    }
-                }
-                else -> false
+            if (revision != previewRevision || catalog !== mediaPeople) return
+            catalog.updateFrame(revision, still, found) { box ->
+                cropPersonThumb(frame, listOf(box[0] * frame.width, box[1] * frame.height,
+                    box[2] * frame.width, box[3] * frame.height), size = 144)
             }
-            if (peopleScanned && swapAssignMode) previewOptionsChanged(reloads = false)
-        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-            throw cancelled
-        } catch (e: Exception) {
-            appendLog("face discovery: ${e.message}")
+            updateFaceRows()
         } finally {
-            peopleScanning = false
+            detectingPeople = false
         }
     }
 
     private fun configureMediaAssignments(still: Boolean, sequential: Boolean): Boolean {
         if (!swapAssignMode || !opts.swapsFace) return false
-        check(NativePipe.setMediaAssignments(mediaPeople.gallery(),
-            mediaPeople.slots(swapPersonAssignments), still, sequential)) {
+        val gallery = mediaPeople.gallery()
+        check(NativePipe.setMediaAssignments(gallery.records, gallery.owners,
+            gallery.sources, still, sequential)) {
             "Could not load face assignments"
         }
         return true
@@ -1926,11 +1892,6 @@ class MainActivity : ComponentActivity() {
                     faceBoxFrame = frame
                 }
 
-                LaunchedEffect(targetVersion, previewWarm, busy, preparing, screen) {
-                    if (screen == Screen.Swap && previewWarm && !busy && !preparing && !peopleScanned)
-                        scanTargetPeople()
-                }
-
                 LaunchedEffect(sources.map { it.uri }, targetVersion, modelsMissing, opts.swapsFace, preparing) {
                     android.util.Log.d("ffpreview", "autowarm fired: src=" +
                         (sourceUri != null) + " tgt=" +
@@ -1956,6 +1917,7 @@ class MainActivity : ComponentActivity() {
                     showLive = true,
                 ) { pad ->
                     Box(Modifier.padding(pad)) {
+                        val frameFaces = visiblePeople
                         when (screen) {
                             Screen.Swap -> SwapScreen(
                                 sourceThumb = sourceThumb,
@@ -1963,14 +1925,15 @@ class MainActivity : ComponentActivity() {
                                 activeSource = swapSourceIndex,
                                 onSelectSource = ::selectSwapSource,
                                 assignMode = swapAssignMode,
-                                personThumbs = swapPersonThumbs,
-                                peopleScanning = peopleScanning,
+                                visibleFaces = frameFaces.faces,
+                                assignedFaces = assignedPeople,
+                                detectingFaces = detectingPeople || seekingPreview,
                                 selectedPerson = swapSelectedPerson,
-                                personAssignments = swapPersonAssignments,
                                 keepOriginalBrush = swapBrushKeepOriginal,
                                 onKeepOriginal = ::selectSwapKeepOriginal,
                                 onToggleAssignMode = ::toggleSwapAssign,
-                                onSelectPerson = ::selectSwapPerson,
+                                onSelectPerson = { selectSwapPerson(frameFaces.revision, it) },
+                                onSelectAssignedPerson = ::selectAssignedPerson,
                                 onClearAssignments = ::clearSwapAssignments,
                                 hasSource = sourceUri != null,
                                 hasTarget = targetFile != null || targetImage != null,
@@ -2088,7 +2051,8 @@ class MainActivity : ComponentActivity() {
                                     // one range cannot mean anything across clips of
                                     // different lengths.
                                     if (photoMakesVideo) runPortrait()
-                                    else if (batchQueue.size > 1) runBatch() else runSwap()
+                                    else if (batchQueue.size > 1 && !(swapAssignMode && opts.swapsFace)) runBatch()
+                                    else runSwap()
                                 },
                                 batch = batchQueue,
                                 batchAutoSave = opts.batchAutoSave,
@@ -3102,7 +3066,8 @@ class MainActivity : ComponentActivity() {
 
     private fun resetSeek(duration: Long = 0L) {
         scrubJob?.cancel()
-        previewRevision++
+        mediaPeople.beginFrame(++previewRevision)
+        updateFaceRows()
         seekingPreview = false
         timeline = VideoTimeline(duration)
     }
@@ -3112,6 +3077,8 @@ class MainActivity : ComponentActivity() {
         if (next == timeline) return
         timeline = next
         val revision = ++previewRevision
+        mediaPeople.beginFrame(revision)
+        updateFaceRows()
         seekingPreview = true
         scrubJob?.cancel()
         clearPreviewFrames()
@@ -3272,7 +3239,7 @@ class MainActivity : ComponentActivity() {
                     pushLipSelection()
                 }
 
-                if (revision != previewRevision || settingsRevision != previewSettingsRevision || discoveryOnly) return@launch
+                if (revision != previewRevision || settingsRevision != previewSettingsRevision) return@launch
 
                 // Every previewed frame, not just the source. The source is checked once,
                 // when the pipeline warms; the target is checked here because the trim
@@ -3293,8 +3260,12 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                val still = targetImage != null
+                if (opts.swapsFace) detectPreviewPeople(frame, revision, still)
+                if (discoveryOnly || revision != previewRevision ||
+                    settingsRevision != previewSettingsRevision) return@launch
                 NativePipe.setActiveSource(swapSourceIndex)
-                val withAssignments = configureMediaAssignments(targetImage != null, sequential = false)
+                val withAssignments = configureMediaAssignments(still, sequential = false)
                 val out = previews.swap(frame, atMs, voiceFile?.absolutePath, withAssignments)
                 if (revision != previewRevision || settingsRevision != previewSettingsRevision) return@launch
                 android.util.Log.d("ffpreview", "  swapped faces=" + out.faces +
@@ -3735,15 +3706,15 @@ class MainActivity : ComponentActivity() {
      * on a rectangle that does not fit -- which would take down the preview effect that
      * calls this, not just the one thumbnail.
      */
-    private fun cropPersonThumb(frame: Bitmap, box: List<Float>): Bitmap? = runCatching {
+    private fun cropPersonThumb(frame: Bitmap, box: List<Float>, size: Int = 96): Bitmap? = runCatching {
         if (box.size < 4 || frame.width < 2 || frame.height < 2) return@runCatching null
         val x0 = box[0].toInt().coerceIn(0, frame.width - 1)
         val y0 = box[1].toInt().coerceIn(0, frame.height - 1)
         val x1 = box[2].toInt().coerceIn(x0 + 1, frame.width)
         val y1 = box[3].toInt().coerceIn(y0 + 1, frame.height)
-        val thumb = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888)
+        val thumb = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         android.graphics.Canvas(thumb).drawBitmap(
-            frame, android.graphics.Rect(x0, y0, x1, y1), android.graphics.Rect(0, 0, 96, 96),
+            frame, android.graphics.Rect(x0, y0, x1, y1), android.graphics.Rect(0, 0, size, size),
             android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
         thumb
     }.getOrNull()
@@ -4681,10 +4652,6 @@ class MainActivity : ComponentActivity() {
     private fun runSwap() {
         if (opts.swapsFace && sourceUri == null) return
         val tgt = targetFile ?: return
-        if (swapAssignMode && peopleScanning) {
-            status = getString(R.string.swap_discovering_people)
-            return
-        }
         // Defence in depth: the Swap button in SwapScreen is already disabled without one
         // when Lip Sync is on, but this is the actual place a no-op run would happen, so it
         // is checked again here rather than trusted from the UI alone.
@@ -4776,7 +4743,7 @@ class MainActivity : ComponentActivity() {
                     // user made against the PREVIEW is gone from it. Without this the mode
                     // would work perfectly on screen and do nothing in the file.
                     val withAssignments = configureMediaAssignments(still = false, sequential = true)
-                    val restored = if (withAssignments) swapPersonAssignments.values.count { it >= 0 } else 0
+                    val restored = if (withAssignments) assignedPeople.size else 0
                     // Same for the lips targets: N faces when set, all faces when not.
                     // Logged so a run that syncs everyone says whether it had a choice.
                     val lipsN = pushLipSelection()

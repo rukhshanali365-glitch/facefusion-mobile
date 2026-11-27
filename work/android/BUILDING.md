@@ -1,7 +1,7 @@
-# MMA Face 3.2
+# MMA Face 3.3
 
-The app requires Android 12 or later on an ARM64 device. Version 3.2 uses package
-`com.facefusion.mobile` and version code 253 on the gated branch.
+The app requires Android 12 or later on an ARM64 device. Version 3.3 uses package
+`com.facefusion.mobile` and version code 254 on the gated branch.
 
 ## Install
 
@@ -16,13 +16,16 @@ The app requires Android 12 or later on an ARM64 device. Version 3.2 uses packag
 
 ## Changes
 
-- The Swap screen detects still-image faces and scans video from beginning to end,
-  adding people as they appear. Thumbnails stay in discovery order. Tap a person to
-  apply the selected source, or use **Keep face** to remove a swap for that person.
-  Other faces stay unchanged in assignment mode. Turn the mode off to use the existing
-  all-face or largest-face behavior.
-- Video export uses the existing ArcFace embeddings plus recent position and appearance
-  to keep assignments stable. Faces with uncertain matches keep their original appearance.
+- **Faces in this frame** updates after the playhead settles. The picker filters
+  low-confidence, small, clipped and blurry video detections.
+- Choose a source and tap a visible face to enable **Assign per person**. Unassigned
+  faces and uncertain matches keep their own faces.
+- **Assigned Faces** stays available while you seek. Select a card to change its source
+  or use **Keep face** to clear its swap. Each identity keeps its clearest reliable
+  thumbnail and up to three views for ArcFace matching.
+- Export uses those views and bounded frame-to-frame tracking. If multiple clips are
+  queued, **Swap current clip** applies the assignments to the visible clip. Turn off
+  assignment mode for batch export.
 - The seek slider controls both preview panes. **Trim export** opens a separate range
   control. A new video exports full length unless the range is changed deliberately.
 - Upright photos retain their decoded pixel dimensions and are saved as PNG. The video
@@ -57,9 +60,10 @@ cannot be used for this upgrade.
 
 - [x] Inspect the base branch, media paths and existing build configuration.
 - [x] Add still-image discovery and per-person routing.
-- [x] Add full-clip discovery and sequential export matching.
-- [x] Separate seek and trim state and guard against stale previews.
-- [x] Add native and JVM regression tests and a media export verifier.
+- [x] Detect faces on the settled preview frame and discard stale seek results.
+- [x] Keep assignments and their clearest thumbnails across frame changes.
+- [x] Add native and JVM regressions for duplicate suppression and selective matching.
+- [x] Retain the independent seek and trim state and existing media export verifier.
 - [ ] Qualify inference quality, offline playback, sustained throughput and memory on
   a Galaxy S23 Ultra with authorized model files and media.
 
@@ -71,10 +75,12 @@ c++ -std=c++17 -Wall -Wextra -Werror work/android/tests/media-identity.cpp -o /t
 ```
 
 On an S23 Ultra, pick an authorized still with two subjects and a clip with two
-subjects who cross paths, leave, and re-enter. Include another subject who appears
-after the start. Assign distinct authorized sources and leave the third person
-unassigned. Compare against the original and check unassigned areas, rotation, crop,
-skin texture and blend edges. Seek near both ends, then export without using trim.
+subjects who cross paths, leave, and re-enter. Seek to a clear view of each face.
+Confirm that **Faces in this frame** changes with the playhead. Assign different
+authorized sources to two faces and leave a third unassigned. Confirm that the
+assigned cards remain accessible when subjects exit. Compare the exported result
+against the original around re-entries, motion blur, skin texture and blend edges.
+Seek near both ends, then export without using trim.
 For a constant-frame-rate AAC MP4 fixture, verify the exported metadata and audio bytes:
 
 ```sh
@@ -87,12 +93,11 @@ acceptance checks remain in [tests/live-microphone.md](tests/live-microphone.md)
 
 ## Limits
 
-- Video discovery observes one frame about every 500 ms and stores up to 128 people.
-  Very short appearances, tiny faces, occlusion and large pose changes can be missed.
-  Visually similar people or extreme changes in appearance can yield an ambiguous match
-  or a duplicate thumbnail. The export matcher skips ambiguous faces.
-- Per-person assignment applies to one target. Batch jobs use the existing shared-source
-  behavior. Apply assignments to individual clips to use per-person export.
+- Video selection runs on the settled preview frame. Seek to a clearer frame if a
+  small, blurry, occluded or clipped face is rejected. Visually similar people and
+  extreme appearance changes can leave a match uncertain. Uncertain matches do not
+  receive a source or create an assignment.
+- Assignments are scoped to the current target and its editing session.
 - Oversized photos are refused with a device-specific limit, at most 24 megapixels, to
   keep processing at the accepted image's original size. Output is 8-bit PNG. Original
   metadata and HDR color are outside this path.
