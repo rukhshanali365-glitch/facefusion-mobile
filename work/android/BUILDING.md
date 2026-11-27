@@ -98,5 +98,7 @@ acceptance checks remain in [tests/live-microphone.md](tests/live-microphone.md)
   metadata and HDR color are outside this path.
 - Video remains H.264/MP4. The encoder may cap size and rate on unsupported inputs.
   Supported audio is copied through. Formats rejected by MP4 use the existing AAC
-  fallback, which can produce video-only output if transcoding fails. Driving audio
+  fallback, which can produce video-only output if transcoding fails. Decoded audio for
+  AAC fallback and lip sync is limited to 24 million PCM samples (about four minutes
+  of 48 kHz stereo). Driving audio
   deliberately replaces the original track when Lip Sync uses it.

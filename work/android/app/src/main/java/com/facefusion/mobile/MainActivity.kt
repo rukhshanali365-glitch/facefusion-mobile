@@ -20,6 +20,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
 import com.facefusion.mobile.ui.*
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -596,6 +597,7 @@ class MainActivity : ComponentActivity() {
     private var previewSettingsRevision = 0L
     private var seekingPreview = false
     private var scrubJob: Job? = null
+    private var targetCloseJob: Job? = null
 
     /** The debounced redraw owned by [previewOptionsChanged]. One at a time. */
     private var refreshJob: Job? = null
@@ -2474,8 +2476,26 @@ class MainActivity : ComponentActivity() {
         stopVoicePlayback()
         // Before the preview's own teardown: the pump holds the pipeline this is about to
         // release, and stop() is what makes it let go.
-        player.stop()
-        previews.release()
+        val wasPlaying = playerOpen && player.active
+        playerOpen = false
+        val ownedSequence = lastPipeSeq
+        CoroutineScope(Dispatchers.IO).launch {
+            player.stop()
+            if (wasPlaying && PipeGuard.holder == "player") {
+                NativePipe.release()
+                PipeGuard.release()
+            }
+            previews.closeTarget()
+            // A cancelled coroutine can still be returning from a blocking JNI call.
+            // Release only after it has yielded the singleton and no new owner has used it.
+            if (PipeGuard.acquire("preview teardown", 5000)) {
+                try {
+                    if (PipeGuard.uninterrupted(ownedSequence)) previews.invalidate()
+                } finally {
+                    PipeGuard.release()
+                }
+            }
+        }
     }
 
     private fun fmt(ms: Float): String {
@@ -3163,7 +3183,10 @@ class MainActivity : ComponentActivity() {
                     return@launch
                 }
                 if (revision != previewRevision || settingsRevision != previewSettingsRevision ||
-                    seekingPreview || busy || preparing) return@launch
+                    seekingPreview || busy || preparing) {
+                    if (PipeGuard.uninterrupted(lastPipeSeq)) lastPipeSeq = PipeGuard.sequence
+                    return@launch
+                }
                 // Someone else has had the pipeline since this screen last used it, so the warm
                 // flag describes their source, not ours.
                 if (!PipeGuard.uninterrupted(lastPipeSeq)) {
@@ -3450,6 +3473,7 @@ class MainActivity : ComponentActivity() {
                 status = getString(R.string.status_target_ready_video,
                                    l.width, l.height, fmt(l.durationMs.toFloat()))
                 // Open it for scrubbing and show the first frame straight away.
+                targetCloseJob?.join()
                 withContext(Dispatchers.IO) { previews.openTarget(l.file.absolutePath, l.fps) }
                 targetVersion++
                 // `preview` too, which this path used to leave set -- see clearPreviewFrames.
@@ -3496,7 +3520,8 @@ class MainActivity : ComponentActivity() {
                 return@launch
             }
             discardOutput()
-            previews.closeTarget()
+            targetCloseJob?.join()
+            withContext(Dispatchers.IO) { previews.closeTarget() }
             targetFile = null
             targetImage = bmp
             durationMs = 0L
@@ -3716,9 +3741,11 @@ class MainActivity : ComponentActivity() {
         val y0 = box[1].toInt().coerceIn(0, frame.height - 1)
         val x1 = box[2].toInt().coerceIn(x0 + 1, frame.width)
         val y1 = box[3].toInt().coerceIn(y0 + 1, frame.height)
-        val crop = Bitmap.createBitmap(frame, x0, y0, x1 - x0, y1 - y0)
-        val thumb = Bitmap.createScaledBitmap(crop, 96, 96, true)
-        if (thumb === frame) thumb.copy(Bitmap.Config.ARGB_8888, false) else thumb
+        val thumb = Bitmap.createBitmap(96, 96, Bitmap.Config.ARGB_8888)
+        android.graphics.Canvas(thumb).drawBitmap(
+            frame, android.graphics.Rect(x0, y0, x1, y1), android.graphics.Rect(0, 0, 96, 96),
+            android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
+        thumb
     }.getOrNull()
 
     /** Release the player entirely -- a new voice is loaded, or the screen is going away. */
@@ -3868,7 +3895,7 @@ class MainActivity : ComponentActivity() {
         // the visible clip goes away would leave a run that starts on a clip nothing on
         // screen mentions.
         batchQueue = emptyList()
-        previews.closeTarget()
+        targetCloseJob = lifecycleScope.launch(Dispatchers.IO) { previews.closeTarget() }
         targetFile = null
         targetImage = null
         targetName = null

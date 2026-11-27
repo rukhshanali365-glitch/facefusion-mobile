@@ -171,42 +171,58 @@ class FrameSeeker private constructor(
         private const val SLACK_US = 2_000L
 
         /** Null when the file has no decodable video track. The caller then falls back. */
-        fun open(path: String): FrameSeeker? = runCatching {
-            val extractor = MediaExtractor().apply { setDataSource(path) }
-            var track = -1
-            var fmt: MediaFormat? = null
-            for (i in 0 until extractor.trackCount) {
-                val f = extractor.getTrackFormat(i)
-                if (f.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) {
-                    track = i; fmt = f; break
+        fun open(path: String): FrameSeeker? {
+            val extractor = MediaExtractor()
+            var codec: MediaCodec? = null
+            var opened = false
+            try {
+                extractor.setDataSource(path)
+                var track = -1
+                var fmt: MediaFormat? = null
+                for (i in 0 until extractor.trackCount) {
+                    val f = extractor.getTrackFormat(i)
+                    if (f.getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true) {
+                        track = i; fmt = f; break
+                    }
+                }
+                val vf = fmt
+                if (track < 0 || vf == null) return null
+                extractor.selectTrack(track)
+
+                // KEY_ROTATION first, the retriever second -- the same order and the same
+                // reasoning as VideoSwapper, which found the format the more reliable source.
+                val rotation = when {
+                    vf.containsKey(MediaFormat.KEY_ROTATION) -> vf.getInteger(MediaFormat.KEY_ROTATION)
+                    else -> runCatching {
+                        val retriever = MediaMetadataRetriever()
+                        try {
+                            retriever.setDataSource(path)
+                            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+                                ?.toIntOrNull() ?: 0
+                        } finally {
+                            retriever.release()
+                        }
+                    }.getOrDefault(0)
+                }
+
+                val decoder = MediaCodec.createDecoderByType(vf.getString(MediaFormat.KEY_MIME)!!)
+                codec = decoder
+                vf.setInteger(MediaFormat.KEY_COLOR_FORMAT,
+                    MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
+                decoder.configure(vf, null, null, 0)
+                decoder.start()
+                val seeker = FrameSeeker(extractor, decoder, vf.getInteger(MediaFormat.KEY_WIDTH),
+                    vf.getInteger(MediaFormat.KEY_HEIGHT), rotation)
+                opened = true
+                return seeker
+            } catch (_: Exception) {
+                return null
+            } finally {
+                if (!opened) {
+                    runCatching { codec?.release() }
+                    extractor.release()
                 }
             }
-            val vf = fmt
-            if (track < 0 || vf == null) { extractor.release(); return null }
-            extractor.selectTrack(track)
-
-            // KEY_ROTATION first, the retriever second -- the same order and the same
-            // reasoning as VideoSwapper, which found the format the more reliable source.
-            val rotation = when {
-                vf.containsKey(MediaFormat.KEY_ROTATION) -> vf.getInteger(MediaFormat.KEY_ROTATION)
-                else -> runCatching {
-                    val r = MediaMetadataRetriever().apply { setDataSource(path) }
-                    val d = r.extractMetadata(
-                        MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toIntOrNull() ?: 0
-                    r.release()
-                    d
-                }.getOrDefault(0)
-            }
-
-            val decoder = MediaCodec.createDecoderByType(vf.getString(MediaFormat.KEY_MIME)!!)
-            vf.setInteger(MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
-            decoder.configure(vf, null, null, 0)
-            decoder.start()
-            FrameSeeker(extractor, decoder,
-                        vf.getInteger(MediaFormat.KEY_WIDTH),
-                        vf.getInteger(MediaFormat.KEY_HEIGHT),
-                        rotation)
-        }.getOrNull()
+        }
     }
 }

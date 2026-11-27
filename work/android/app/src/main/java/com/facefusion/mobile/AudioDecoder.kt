@@ -49,8 +49,10 @@ object AudioDecoder {
      * failing. Throws only on a decoder that cannot be configured.
      */
     fun decode(path: String, trimStartUs: Long = 0L, trimEndUs: Long = Long.MAX_VALUE): Pcm? {
-        val extractor = MediaExtractor().apply { setDataSource(path) }
+        val extractor = MediaExtractor()
+        var decoder: MediaCodec? = null
         try {
+            extractor.setDataSource(path)
             var track = -1
             var format: MediaFormat? = null
             for (i in 0 until extractor.trackCount) {
@@ -68,6 +70,7 @@ object AudioDecoder {
 
             val mime = af.getString(MediaFormat.KEY_MIME)!!
             val codec = MediaCodec.createDecoderByType(mime)
+            decoder = codec
             codec.configure(af, null, null, 0)
             codec.start()
 
@@ -122,6 +125,7 @@ object AudioDecoder {
                             buf.position(info.offset)
                             buf.limit(info.offset + info.size)
                             val chunk = toShorts(buf, info.size, pcmEncoding)
+                            if (chunk.size > MAX_PCM_SAMPLES - totalShorts) return null
                             out.add(chunk)
                             totalShorts += chunk.size
                         }
@@ -132,9 +136,6 @@ object AudioDecoder {
                     }
                 }
             }
-            codec.stop()
-            codec.release()
-
             val merged = ShortArray(totalShorts)
             var at = 0
             for (chunk in out) {
@@ -143,9 +144,15 @@ object AudioDecoder {
             }
             return Pcm(merged, sampleRate, channels)
         } finally {
+            runCatching { decoder?.stop() }
+            runCatching { decoder?.release() }
             extractor.release()
         }
     }
+
+    // At merge time the chunk list and the contiguous buffer coexist. Compressed
+    // audio copy-through uses neither and remains bounded for the whole clip.
+    private const val MAX_PCM_SAMPLES = 24_000_000
 
     /** One decoded buffer to 16-bit samples, whatever the decoder chose to emit. */
     private fun toShorts(buf: ByteBuffer, size: Int, pcmEncoding: Int): ShortArray {

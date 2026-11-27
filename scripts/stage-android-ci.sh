@@ -8,7 +8,11 @@ mkdir -p "$runtime" "$repo/work/android/ncnn"
 
 fetch() {
     local url="$1" path="$2" checksum="$3"
-    if [[ ! -f "$path" ]]; then curl -fL --retry 3 "$url" -o "$path"; fi
+    if [[ ! -f "$path" ]]; then
+        curl -fL --retry 3 "$url" -o "$path.part"
+        echo "$checksum  $path.part" | sha256sum --check
+        mv "$path.part" "$path"
+    fi
     echo "$checksum  $path" | sha256sum --check
 }
 

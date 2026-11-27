@@ -76,10 +76,7 @@ jobs:
         run: |
           chmod +x ./gradlew
           set +e
-          # Absolute path to the keystore because Gradle's injected signing
-          # properties are resolved against the daemon working directory.
-          KS_ABS="$GITHUB_WORKSPACE/work/android/keystore.jks"
-          test -f "$KS_ABS"
+          test -f keystore.properties
           ./gradlew --no-daemon :app:assembleRelease \
             -Pandroid.injected.testOnly=false \
             --stacktrace 2>&1 | tee "$RUNNER_TEMP/assemble.log"
@@ -92,14 +89,6 @@ jobs:
           mkdir -p "$RUNNER_TEMP/log-artifact"
           cp "$RUNNER_TEMP/assemble.log" "$RUNNER_TEMP/log-artifact/assemble.log"
           exit $rc
-
-      - name: Upload build log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: ${{ runner.temp }}/log-artifact/
-          if-no-files-found: ignore
 
       - name: Run unit tests
         working-directory: work/android
@@ -125,6 +114,14 @@ jobs:
         run: |
           python3 ../../scripts/parse_test_results.py "app/build/test-results/**/TEST-*.xml" > /tmp/summary.txt 2>&1 || true
           cat /tmp/summary.txt
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ${{ runner.temp }}/log-artifact/
+          if-no-files-found: ignore
 
       - name: Find and verify APK
         if: success()
