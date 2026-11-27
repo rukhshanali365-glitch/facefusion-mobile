@@ -1245,7 +1245,7 @@ std::vector<ffmedia::Face> Pipeline::mediaFaces(const std::vector<Face>& faces, 
   return result;
 }
 
-void Pipeline::setMediaAssignments(std::vector<ffmedia::Face> people, std::vector<int> slots,
+void Pipeline::setMediaAssignments(ffmedia::Gallery people, std::vector<int> slots,
                                    bool still, bool sequential) {
   p_->mediaMatcher = ffmedia::Matcher(std::move(people));
   p_->mediaSlots = std::move(slots);
@@ -1256,8 +1256,15 @@ void Pipeline::setMediaAssignments(std::vector<ffmedia::Face> people, std::vecto
 void Pipeline::beginMediaFrame(const std::vector<Face>& faces, int w, int h) {
   // ArcFace's distance is half cosine distance. Cap the general reference threshold
   // for multi-person routing where a false match would apply someone else's source.
-  const auto ids = p_->mediaMatcher.match(mediaFaces(faces, w, h), p_->mediaStill,
-      p_->mediaSequential, std::min(p_->cfg.referenceDistance, 0.26f));
+  auto candidates = mediaFaces(faces, w, h);
+  if (!p_->mediaStill) {
+    for (size_t i = 0; i < faces.size(); ++i) {
+      if (faces[i].lmScore < 0.30f || !std::isfinite(faces[i].lmScore))
+        candidates[i].embedding.fill(0.f);
+    }
+  }
+  const auto ids = p_->mediaMatcher.match(candidates, p_->mediaStill,
+      p_->mediaSequential, std::min(p_->cfg.referenceDistance, ffmedia::kVideoMatchDistance));
   p_->mediaSources.clear();
   for (int id : ids)
     p_->mediaSources.push_back(ffmedia::sourceFor(id, p_->mediaSlots, p_->sourceSlots.size()));

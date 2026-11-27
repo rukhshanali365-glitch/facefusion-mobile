@@ -91,7 +91,7 @@
     <!-- ==================================================== assign-per-person (MMA Arabic) -->
     <string name="live_assign_title">تعيين لكل شخص</string>
     <string name="live_assign_hint">تعيين لكل شخص: اختر مصدرًا ثم اضغط على وجه. الوجوه التي لا تضغط عليها تبقى على مصدرها.</string>
-    <string name="swap_assign_on">لا شيء يتغير حتى تضغط على شخص</string>
+    <string name="swap_assign_on">يتم تبديل الوجوه المعيّنة فقط</string>
     <string name="swap_assign_off">كل وجه يأخذ المصدر المختار</string>
     <string name="swap_assign_hint">اختر مصدرًا ثم اضغط على شخص. تبقى الوجوه غير المعينة كما هي.</string>
     <string name="set_tab_models">النماذج</string>
@@ -207,7 +207,13 @@
 
     <string name="swap_seek">التنقل في الفيديو</string>
     <string name="swap_trim">قص الفيديو عند التصدير</string>
-    <string name="swap_discovering_people">جارٍ البحث عن الوجوه في الوسائط…</string>
+    <string name="swap_discovering_people">جارٍ فحص هذا الإطار…</string>
     <string name="swap_pick_source_to_assign">أضف وجهًا مصدرًا لتعيينه لشخص.</string>
     <string name="swap_photo_too_large">يستطيع هذا الجهاز معالجة الصور بحجمها الأصلي حتى نحو %1$d ميغابكسل.</string>
+    <string name="swap_visible_faces">الوجوه في هذا الإطار</string>
+    <string name="swap_assigned_faces">الوجوه المعيّنة</string>
+    <string name="swap_visible_face">الوجه %1$d</string>
+    <string name="swap_assign_uncertain">غير مؤكد</string>
+    <string name="swap_assign_no_people">لم يتم العثور على وجوه واضحة. انتقل إلى إطار أوضح.</string>
+    <string name="swap_action_current_clip">تبديل المقطع الحالي</string>
 </resources>

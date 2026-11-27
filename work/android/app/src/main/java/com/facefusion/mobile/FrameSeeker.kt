@@ -6,7 +6,6 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.os.SystemClock
-import kotlinx.coroutines.ensureActive
 import java.io.Closeable
 import java.nio.ByteBuffer
 
@@ -78,19 +77,6 @@ class FrameSeeker private constructor(
             if (reachedTarget) break
         }
         return if (cursor.ended && timeUs > 0L && best != null && !reachedTarget) null else upright(best)
-    }
-
-    /** Decode once in presentation order, converting only frames used by discovery. */
-    suspend fun scanFrames(intervalUs: Long, onFrame: suspend (ByteArray) -> Boolean): Boolean {
-        val cursor = DecodeCursor()
-        var nextUs = 0L
-        while (!cursor.ended) {
-            kotlinx.coroutines.currentCoroutineContext().ensureActive()
-            val frame = nextFrame(cursor, nextUs) ?: return cursor.ended
-            if (!onFrame(upright(frame.bgr) ?: return false)) return false
-            nextUs = frame.ptsUs + intervalUs
-        }
-        return true
     }
 
     private class DecodeCursor {

@@ -1,6 +1,7 @@
 package com.facefusion.mobile.ui
 
 import android.graphics.Bitmap
+import com.facefusion.mobile.MediaFace
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -124,27 +125,22 @@ data class RunUi(
 
 @Composable
 @OptIn(ExperimentalMaterial3Api::class)
-fun SwapScreen(
+internal fun SwapScreen(
     sourceThumb: Bitmap?,
     /** Every source face, in native slot order. Drawn by the shared [SourceRow]. */
     sourceThumbs: List<Bitmap> = emptyList(),
     activeSource: Int = 0,
     onSelectSource: (Int) -> Unit = {},
-    /**
-     * ASSIGN PER PERSON, the Swap screen's own. Live decides by tracking a person through
-     * a sequence of frames; there is no sequence here, so a tap stores the person's
-     * IDENTITY and native matches it on every frame of the run.
-     */
     assignMode: Boolean = false,
-    personThumbs: List<Bitmap> = emptyList(),
-    peopleScanning: Boolean = false,
+    visibleFaces: List<MediaFace<Bitmap>> = emptyList(),
+    assignedFaces: List<MediaFace<Bitmap>> = emptyList(),
+    detectingFaces: Boolean = false,
     selectedPerson: Int = -1,
-    /** person index -> source slot, or -1 for "keeps their own face". */
-    personAssignments: Map<Int, Int> = emptyMap(),
     keepOriginalBrush: Boolean = false,
     onKeepOriginal: () -> Unit = {},
     onToggleAssignMode: () -> Unit = {},
     onSelectPerson: (Int) -> Unit = {},
+    onSelectAssignedPerson: (Int) -> Unit = {},
     onClearAssignments: () -> Unit = {},
     hasSource: Boolean,
     hasTarget: Boolean,
@@ -353,6 +349,13 @@ fun SwapScreen(
     modifier: Modifier = Modifier,
 ) {
     val idle = !run.busy && !run.preparing
+    val swapActionLabel = when {
+        run.busy -> R.string.swap_cancel
+        batch.size > 1 && !photoMakesVideo ->
+            if (assignMode && opts.swapsFace) R.string.swap_action_current_clip else R.string.swap_action_batch
+        opts.swapsFace -> R.string.swap_action
+        else -> R.string.swap_action_run
+    }
 
     // Both panes share one height, chosen so the pair fits on screen together with the
     // controls around them. The reserve is the wordmark, source button, captions, trim,
@@ -896,10 +899,6 @@ fun SwapScreen(
             }
         }
 
-        // ---- ASSIGN PER PERSON. Video and stills alike: the preview pane swaps
-        // through the warm pipeline either way, and native assignments live on
-        // that pipeline -- so a still honours them exactly like a video frame
-        // does, and the pane IS the result the Save button writes.
         if (opts.swapsFace && hasTarget) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
@@ -910,7 +909,7 @@ fun SwapScreen(
                          style = MaterialTheme.typography.bodySmall,
                          color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
-                if (assignMode && personAssignments.isNotEmpty()) {
+                if (assignedFaces.isNotEmpty()) {
                     TextButton(onClick = onClearAssignments, enabled = idle) {
                         Text(stringResource(R.string.live_assign_clear))
                     }
@@ -919,67 +918,21 @@ fun SwapScreen(
                        onCheckedChange = { onToggleAssignMode() },
                        enabled = idle && hasSource)
             }
-            if (peopleScanning || personThumbs.isNotEmpty() || assignMode) {
-                Text(stringResource(when {
-                    peopleScanning -> R.string.swap_discovering_people
-                    personThumbs.isEmpty() -> R.string.swap_assign_no_people
-                    !hasSource -> R.string.swap_pick_source_to_assign
-                    else -> R.string.swap_assign_hint
-                }),
-                     style = MaterialTheme.typography.bodySmall,
-                     color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Row(
-                    Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    personThumbs.forEachIndexed { index, thumb ->
-                        val label = stringResource(R.string.swap_assign_person, index + 1)
-                        Column(
-                            Modifier.width(72.dp).clickable(enabled = idle && hasSource) {
-                                onSelectPerson(index)
-                            },
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                        ) {
-                            Box {
-                                Image(
-                                    thumb.asImageBitmap(),
-                                    contentDescription = label,
-                                    modifier = Modifier
-                                        .size(62.dp)
-                                        .clip(CircleShape)
-                                        .border(
-                                            BorderStroke(
-                                                if (index == selectedPerson) 3.dp else 1.dp,
-                                                if (index == selectedPerson) FfRed
-                                                else MaterialTheme.colorScheme.outlineVariant,
-                                            ), CircleShape),
-                                    contentScale = ContentScale.Crop,
-                                )
-                                // ROUND faces, SQUARE sources, and a badge saying which
-                                // source each face got -- so the whole mapping is legible
-                                // without tapping anything to find out.
-                                personAssignments[index]?.let { slot ->
-                                    Text(
-                                        if (slot < 0)
-                                            stringResource(R.string.swap_assign_badge_keep)
-                                        else stringResource(
-                                            R.string.swap_assign_badge, slot + 1),
-                                        color = Color.White,
-                                        fontSize = 9.sp,
-                                        modifier = Modifier
-                                            .align(Alignment.BottomEnd)
-                                            .background(FfRed, CircleShape)
-                                            .padding(horizontal = 5.dp, vertical = 1.dp),
-                                    )
-                                }
-                            }
-                            Text(label, fontSize = 10.sp, maxLines = 1,
-                                 overflow = TextOverflow.Ellipsis,
-                                 color = if (index == selectedPerson)
-                                             MaterialTheme.colorScheme.onSurface
-                                         else MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
+            Caption(stringResource(R.string.swap_visible_faces))
+            Text(stringResource(when {
+                detectingFaces -> R.string.swap_discovering_people
+                visibleFaces.isEmpty() -> R.string.swap_assign_no_people
+                !hasSource -> R.string.swap_pick_source_to_assign
+                else -> R.string.swap_assign_hint
+            }), style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            if (visibleFaces.isNotEmpty()) {
+                MediaFaceRow(visibleFaces, selectedPerson, idle && hasSource, onSelectPerson)
+            }
+            if (assignedFaces.isNotEmpty()) {
+                Caption(stringResource(R.string.swap_assigned_faces))
+                MediaFaceRow(assignedFaces, selectedPerson, idle && hasSource) { index ->
+                    assignedFaces[index].person?.let(onSelectAssignedPerson)
                 }
             }
         }
@@ -1336,10 +1289,7 @@ fun SwapScreen(
             // fully-round things on a screen of 14.dp panes and cards.
             shape = RoundedCornerShape(14.dp),
         ) { Text(stringResource(
-                    if (run.busy) R.string.swap_cancel
-                    else if (batch.size > 1 && !photoMakesVideo) R.string.swap_action_batch
-                    else if (opts.swapsFace) R.string.swap_action
-                    else R.string.swap_action_run,
+                    swapActionLabel,
                     batch.size),
                  fontSize = 16.sp) }
         if (photoMakesVideo && idle) Text(
@@ -1675,10 +1625,7 @@ fun SwapScreen(
                     .height(52.dp),
                 shape = RoundedCornerShape(14.dp),
             ) { Text(stringResource(
-                        if (run.busy) R.string.swap_cancel
-                        else if (batch.size > 1 && !photoMakesVideo) R.string.swap_action_batch
-                        else if (opts.swapsFace) R.string.swap_action
-                        else R.string.swap_action_run,
+                        swapActionLabel,
                         batch.size),
                      fontSize = 16.sp) }
         }
@@ -1910,6 +1857,58 @@ private fun FaceEditorSliders(opts: SwapOptions, onOptsChange: (SwapOptions) -> 
     if (opts.editor.any { it != 0f }) {
         TextButton(onClick = { onOptsChange(opts.copy(editor = SwapOptions().editor)) }) {
             Text(stringResource(R.string.opt_edit_reset))
+        }
+    }
+}
+
+
+@Composable
+private fun MediaFaceRow(
+    faces: List<MediaFace<Bitmap>>,
+    selectedPerson: Int,
+    enabled: Boolean,
+    onSelect: (Int) -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        faces.forEachIndexed { index, face ->
+            val label = when {
+                !face.selectable -> stringResource(R.string.swap_assign_uncertain)
+                face.person != null -> stringResource(R.string.swap_assign_person, face.person + 1)
+                else -> stringResource(R.string.swap_visible_face, index + 1)
+            }
+            val selected = face.person == selectedPerson
+            Column(
+                Modifier.width(72.dp).clickable(enabled = enabled && face.selectable) { onSelect(index) },
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Box {
+                    Image(
+                        face.thumbnail.asImageBitmap(),
+                        contentDescription = label,
+                        modifier = Modifier.size(62.dp).clip(CircleShape).border(
+                            BorderStroke(if (selected) 3.dp else 1.dp,
+                                if (selected) FfRed else MaterialTheme.colorScheme.outlineVariant),
+                            CircleShape,
+                        ),
+                        contentScale = ContentScale.Crop,
+                        alpha = if (face.selectable) 1f else 0.55f,
+                    )
+                    face.source?.let { slot ->
+                        Text(
+                            stringResource(R.string.swap_assign_badge, slot + 1),
+                            color = Color.White,
+                            fontSize = 9.sp,
+                            modifier = Modifier.align(Alignment.BottomEnd).background(FfRed, CircleShape)
+                                .padding(horizontal = 5.dp, vertical = 1.dp),
+                        )
+                    }
+                }
+                Text(label, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
     }
 }

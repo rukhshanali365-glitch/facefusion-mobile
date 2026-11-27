@@ -630,37 +630,83 @@ Java_com_facefusion_mobile_NativePipe_detectFaces(JNIEnv* env, jclass, jbyteArra
   return out;
 }
 
-static std::vector<ffmedia::Face> readMediaGallery(JNIEnv* env, jfloatArray input) {
-  const auto size = env->GetArrayLength(input);
-  if (size % ffmedia::kRecordSize != 0 || size > ffmedia::kMaxPeople * ffmedia::kRecordSize)
-    return {};
-  std::vector<ffmedia::Face> people(size / ffmedia::kRecordSize);
-  for (size_t i = 0; i < people.size(); ++i) {
-    const jsize offset = (jsize)i * ffmedia::kRecordSize;
-    env->GetFloatArrayRegion(input, offset, 4, people[i].box.data());
-    env->GetFloatArrayRegion(input, offset + 4, ffmedia::kEmbeddingSize,
-                            people[i].embedding.data());
+// Each sample has a stable person index. The picker and renderer use the same
+// gallery so a second angle of a person never behaves like a second source slot.
+static bool readMediaGallery(JNIEnv* env, jfloatArray input, jintArray owners,
+                             ffmedia::Gallery& people) {
+  const auto count = env->GetArrayLength(owners);
+  if (count > ffmedia::kMaxPeople * ffmedia::kMaxSamples ||
+      env->GetArrayLength(input) != count * ffmedia::kRecordSize) return false;
+  std::vector<jint> ids(count);
+  if (count > 0) env->GetIntArrayRegion(owners, 0, count, ids.data());
+  for (jsize i = 0; i < count; ++i) {
+    const jint id = ids[i];
+    if (id < 0 || id >= ffmedia::kMaxPeople) return false;
+    if ((size_t)id >= people.size()) people.resize(id + 1);
+    auto& samples = people[id];
+    if (samples.size() == ffmedia::kMaxSamples) return false;
+    auto& face = samples.emplace_back();
+    const jsize offset = i * ffmedia::kRecordSize;
+    env->GetFloatArrayRegion(input, offset, 4, face.box.data());
+    env->GetFloatArrayRegion(input, offset + 4, ffmedia::kEmbeddingSize, face.embedding.data());
   }
-  return people;
+  return true;
+}
+
+static float mediaThumbnailQuality(const ffcv::Image& image, const ffpipe::Face& face) {
+  const float x0 = std::max(0.f, face.box[0]), y0 = std::max(0.f, face.box[1]);
+  const float x1 = std::min((float)image.w, face.box[2]);
+  const float y1 = std::min((float)image.h, face.box[3]);
+  const float w = x1 - x0, h = y1 - y0;
+  if (w < 40.f || h < 40.f) return 0.f;
+  const float coverage = w * h / ((face.box[2] - face.box[0]) * (face.box[3] - face.box[1]));
+  constexpr size_t side = 40;
+  std::array<float, side * side> patch{};
+  for (size_t y = 0; y < side; ++y) {
+    const float fy = y0 + h * (0.18f + 0.64f * y / (side - 1));
+    const int iy = (int)fy;
+    const auto* top = image.row(iy);
+    const auto* bottom = image.row(iy + 1);
+    const float ty = fy - iy;
+    for (size_t x = 0; x < side; ++x) {
+      const float fx = x0 + w * (0.18f + 0.64f * x / (side - 1));
+      const int ix = (int)fx;
+      const float tx = fx - ix;
+      const auto luma = [](const uint8_t* px) {
+        return 0.114f * px[0] + 0.587f * px[1] + 0.299f * px[2];
+      };
+      const float upper = (1.f - tx) * luma(top + ix * 3) + tx * luma(top + (ix + 1) * 3);
+      const float lower = (1.f - tx) * luma(bottom + ix * 3) + tx * luma(bottom + (ix + 1) * 3);
+      patch[y * side + x] = (1.f - ty) * upper + ty * lower;
+    }
+  }
+  return ffmedia::pickerQuality(std::min(w, h), coverage, face.detScore, face.lmScore,
+                                ffmedia::sharpness<side>(patch));
 }
 
 JNIEXPORT jfloatArray JNICALL
 Java_com_facefusion_mobile_NativePipe_discoverMediaFaces(JNIEnv* env, jclass, jbyteArray bgr,
-    jint w, jint h, jfloatArray gallery) {
-  if (!g_pipe || w <= 0 || h <= 0 || (int64_t)w * h * 3 != env->GetArrayLength(bgr))
+    jint w, jint h, jfloatArray gallery, jintArray owners, jboolean still) {
+  ffmedia::Gallery people;
+  if (!g_pipe || w <= 0 || h <= 0 || (int64_t)w * h * 3 != env->GetArrayLength(bgr) ||
+      !readMediaGallery(env, gallery, owners, people))
     return env->NewFloatArray(0);
   ffcv::Image image(w, h, 3);
   env->GetByteArrayRegion(bgr, 0, (jsize)image.data.size(), (jbyte*)image.data.data());
-  const auto faces = g_pipe->mediaFaces(g_pipe->analyse(image, false, true), w, h);
-  ffmedia::Matcher matcher(readMediaGallery(env, gallery));
-  const auto matches = matcher.match(faces, false, false, 0.24f);
+  const auto detected = g_pipe->analyse(image, false, true);
+  const auto faces = g_pipe->mediaFaces(detected, w, h);
+  const auto matches = ffmedia::Matcher(std::move(people)).match(
+      faces, still, false, ffmedia::kVideoMatchDistance, true);
   std::vector<float> flat;
-  flat.reserve(faces.size() * (ffmedia::kRecordSize + 1));
+  flat.reserve(faces.size() * (ffmedia::kRecordSize + 2));
   for (size_t i = 0; i < faces.size(); ++i) {
     const auto& f = faces[i];
+    const float quality = still ? 1.f : mediaThumbnailQuality(image, detected[i]);
+    if (quality <= 0.f || (!still && !ffmedia::validEmbedding(f))) continue;
     flat.insert(flat.end(), f.box.begin(), f.box.end());
     flat.insert(flat.end(), f.embedding.begin(), f.embedding.end());
     flat.push_back((float)matches[i]);
+    flat.push_back(quality);
   }
   jfloatArray out = env->NewFloatArray((jsize)flat.size());
   if (out && !flat.empty()) env->SetFloatArrayRegion(out, 0, (jsize)flat.size(), flat.data());
@@ -669,10 +715,9 @@ Java_com_facefusion_mobile_NativePipe_discoverMediaFaces(JNIEnv* env, jclass, jb
 
 JNIEXPORT jboolean JNICALL
 Java_com_facefusion_mobile_NativePipe_setMediaAssignments(JNIEnv* env, jclass,
-    jfloatArray gallery, jintArray sources, jboolean still, jboolean sequential) {
-  if (!g_pipe) return JNI_FALSE;
-  auto people = readMediaGallery(env, gallery);
-  if (env->GetArrayLength(gallery) != (jsize)people.size() * ffmedia::kRecordSize ||
+    jfloatArray gallery, jintArray owners, jintArray sources, jboolean still, jboolean sequential) {
+  ffmedia::Gallery people;
+  if (!g_pipe || !readMediaGallery(env, gallery, owners, people) ||
       env->GetArrayLength(sources) != (jsize)people.size()) return JNI_FALSE;
   std::vector<int> slots(people.size());
   if (!slots.empty()) env->GetIntArrayRegion(sources, 0, (jsize)slots.size(), slots.data());
