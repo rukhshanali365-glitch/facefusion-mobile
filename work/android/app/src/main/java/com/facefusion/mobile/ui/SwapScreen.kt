@@ -28,6 +28,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
@@ -121,6 +123,7 @@ data class RunUi(
 )
 
 @Composable
+@OptIn(ExperimentalMaterial3Api::class)
 fun SwapScreen(
     sourceThumb: Bitmap?,
     /** Every source face, in native slot order. Drawn by the shared [SourceRow]. */
@@ -133,16 +136,8 @@ fun SwapScreen(
      * IDENTITY and native matches it on every frame of the run.
      */
     assignMode: Boolean = false,
-    /**
-     * The people found when the mode was switched on, in that FROZEN frame's order.
-     *
-     * ⚠ NOT `faceBoxes`' order. Those boxes follow the frame on screen and are
-     * re-scored on every seek; this row is captured once per target precisely so the
-     * detector's per-frame ordering cannot change which face "Person 1" means. The two
-     * agree on the frame the snapshot came from and nowhere else, which is why nothing
-     * indexes one with the other.
-     */
     personThumbs: List<Bitmap> = emptyList(),
+    peopleScanning: Boolean = false,
     selectedPerson: Int = -1,
     /** person index -> source slot, or -1 for "keeps their own face". */
     personAssignments: Map<Int, Int> = emptyMap(),
@@ -166,6 +161,8 @@ fun SwapScreen(
     trimStartMs: Float,
     trimEndMs: Float,
     onTrimChange: (Float, Float, TrimEdge) -> Unit,
+    playheadMs: Float,
+    onSeek: (Float) -> Unit,
     /** width / height of the target. Below 1 the panes go side by side. */
     targetAspect: Float,
     /** The target video's own rate, and the cap on what can be chosen. */
@@ -903,7 +900,7 @@ fun SwapScreen(
         // through the warm pipeline either way, and native assignments live on
         // that pipeline -- so a still honours them exactly like a video frame
         // does, and the pane IS the result the Save button writes.
-        if (opts.swapsFace && hasTarget && sourceThumbs.isNotEmpty()) {
+        if (opts.swapsFace && hasTarget) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text(stringResource(R.string.live_assign_title),
@@ -918,16 +915,17 @@ fun SwapScreen(
                         Text(stringResource(R.string.live_assign_clear))
                     }
                 }
-                // One source plus "keep the original face" is already useful: it is how
-                // you swap everyone EXCEPT somebody.
                 Switch(checked = assignMode,
                        onCheckedChange = { onToggleAssignMode() },
-                       enabled = idle)
+                       enabled = idle && hasSource)
             }
-            if (assignMode) {
-                Text(stringResource(if (personThumbs.isEmpty())
-                                        R.string.swap_assign_no_people
-                                    else R.string.swap_assign_hint),
+            if (peopleScanning || personThumbs.isNotEmpty() || assignMode) {
+                Text(stringResource(when {
+                    peopleScanning -> R.string.swap_discovering_people
+                    personThumbs.isEmpty() -> R.string.swap_assign_no_people
+                    !hasSource -> R.string.swap_pick_source_to_assign
+                    else -> R.string.swap_assign_hint
+                }),
                      style = MaterialTheme.typography.bodySmall,
                      color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Row(
@@ -937,7 +935,7 @@ fun SwapScreen(
                     personThumbs.forEachIndexed { index, thumb ->
                         val label = stringResource(R.string.swap_assign_person, index + 1)
                         Column(
-                            Modifier.width(72.dp).clickable(enabled = idle) {
+                            Modifier.width(72.dp).clickable(enabled = idle && hasSource) {
                                 onSelectPerson(index)
                             },
                             horizontalAlignment = Alignment.CenterHorizontally,
@@ -1173,28 +1171,43 @@ fun SwapScreen(
         // ---------------------------------------------------------------- trim
         if (durationMs > 0) {
             Column {
+                var trimOpen by rememberSaveable { mutableStateOf(false) }
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Caption(stringResource(R.string.swap_clip), Modifier.weight(1f))
-                    Text(
-                        "${fmt(trimStartMs)} – ${fmt(trimEndMs)}",
-                        style = MaterialTheme.typography.bodySmall,
-                        fontFamily = FontFamily.Monospace,
-                    )
+                    Caption(stringResource(R.string.swap_seek), Modifier.weight(1f))
+                    Text("${fmt(playheadMs)} / ${fmt(durationMs.toFloat())}",
+                         style = MaterialTheme.typography.bodySmall,
+                         fontFamily = FontFamily.Monospace)
                 }
-                RangeSlider(
-                    value = trimStartMs..trimEndMs,
-                    onValueChange = { r ->
-                        // Which handle moved: RangeSlider reports the whole range, so the
-                        // edge has to be inferred by comparing against what it was. The
-                        // previews then follow the handle under the finger rather than
-                        // always showing the start frame.
-                        val edge = if (r.start != trimStartMs) TrimEdge.Start else TrimEdge.End
-                        // Keep at least a third of a second, so the encoder always gets a frame.
-                        onTrimChange(r.start, maxOf(r.endInclusive, r.start + 333f), edge)
-                    },
+                val playheadColor = MaterialTheme.colorScheme.primary
+                val seekLabel = stringResource(R.string.swap_seek)
+                Slider(
+                    value = playheadMs,
+                    onValueChange = onSeek,
                     valueRange = 0f..durationMs.toFloat(),
                     enabled = idle,
+                    modifier = Modifier.fillMaxWidth().semantics {
+                        contentDescription = seekLabel
+                    },
+                    thumb = {
+                        Box(Modifier.width(3.dp).height(28.dp).background(playheadColor))
+                    },
                 )
+                TextButton(onClick = { trimOpen = !trimOpen }, enabled = idle) {
+                    Text(stringResource(R.string.swap_trim))
+                }
+                if (trimOpen) {
+                    Text("${fmt(trimStartMs)} – ${fmt(trimEndMs)}",
+                         style = MaterialTheme.typography.bodySmall)
+                    RangeSlider(
+                        value = trimStartMs..trimEndMs,
+                        onValueChange = { range ->
+                            val edge = if (range.start != trimStartMs) TrimEdge.Start else TrimEdge.End
+                            onTrimChange(range.start, range.endInclusive, edge)
+                        },
+                        valueRange = 0f..durationMs.toFloat(),
+                        enabled = idle,
+                    )
+                }
                 // The REAL rate, not a hardcoded 30. The estimate was wrong on every
                 // clip that was not 30 fps, and it is the number the ETA is read against.
                 val effFps = if (opts.outputFps in 1..inputFps) opts.outputFps else inputFps

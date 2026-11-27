@@ -261,8 +261,8 @@ class PreviewEngine {
      *  mouths the new one. */
     private var appliedVoiceTrim: Pair<Long, Long>? = null
 
-    /** True when a pipeline is loaded AND a source face has been applied to it. */
-    val isWarm: Boolean get() = loadedSwapper != null && appliedSlots.isNotEmpty()
+    val isWarm: Boolean get() = loadedSwapper != null
+    val hasRegisteredSource: Boolean get() = appliedSlots.isNotEmpty()
 
     fun invalidate() {
         if (loadedSwapper != null) NativePipe.release()
@@ -346,10 +346,11 @@ class PreviewEngine {
         slots: List<SourceSlot>,
         activeSource: Int = 0,
         assignEnabled: Boolean = false,
+        discoveryOnly: Boolean = false,
         gate: (suspend () -> String?)? = null,
     ): String? = withContext(Dispatchers.Default) {
         // No source is a valid state only while nothing is being swapped.
-        if (slots.isEmpty() && opts.swapsFace) return@withContext "No source image"
+        if (slots.isEmpty() && opts.swapsFace && !discoveryOnly) return@withContext "No source image"
         val tags = slots.map { it.tag }
         // The SMALLEST job that is out of date, of three, in increasing cost:
         //   options  -> push them to the loaded pipeline, no I/O at all
@@ -369,7 +370,7 @@ class PreviewEngine {
                 // Same faces in the same order: nothing to reload. The two things that
                 // are NOT part of that identity still get pushed, because both are one
                 // tap away and neither needs a model touched.
-                NativePipe.setActiveSource(activeSource.coerceIn(0, slots.lastIndex))
+                if (slots.isNotEmpty()) NativePipe.setActiveSource(activeSource.coerceIn(0, slots.lastIndex))
                 NativePipe.setFaceAssignEnabled(assignEnabled)
                 return@withContext null
             }
@@ -432,11 +433,12 @@ class PreviewEngine {
      * swapped frame" would show an unswapped image with no hint why, which is exactly the
      * kind of silent wrongness this preview exists to catch -- hence [Swapped.faces].
      */
-    suspend fun swap(frame: Bitmap, timeMs: Float = 0f, voicePath: String? = null):
+    suspend fun swap(frame: Bitmap, timeMs: Float = 0f, voicePath: String? = null,
+                     mediaAssignments: Boolean = false):
             Swapped = withContext(Dispatchers.Default) {
         if (!isWarm) return@withContext Swapped(null, 0, "Pipeline is not loaded")
         runCatching {
-            val soft = frame.copy(Bitmap.Config.ARGB_8888, false)
+            val soft = frame.asArgb8888() ?: error("Could not read preview pixels")
             val w = soft.width
             val h = soft.height
             val px = IntArray(w * h)
@@ -450,11 +452,15 @@ class PreviewEngine {
             val frameIndex = if (loadedOpts?.lipSync == true && voicePath != null &&
                                  appliedVoice == voicePath)
                 (timeMs / 1000.0 * audioFps).roundToInt() else -1
-            val faces = NativePipe.processFrameAt(bgr, w, h, frameIndex)
+            val faces = if (mediaAssignments) NativePipe.processMediaFrameAt(bgr, w, h, frameIndex)
+                        else NativePipe.processFrameAt(bgr, w, h, frameIndex)
             if (faces < 0) return@runCatching Swapped(null, 0, NativePipe.lastError())
             if (faces == 0) return@runCatching Swapped(null, 0, null)
 
             val out = NativePipe.bgrToArgb(bgr, w, h, w, h)
+            if (soft.hasAlpha()) {
+                for (i in out.indices) out[i] = (out[i] and 0x00ffffff) or (px[i] and 0xff000000.toInt())
+            }
             Swapped(Bitmap.createBitmap(out, w, h, Bitmap.Config.ARGB_8888), faces)
         }.getOrElse { Swapped(null, 0, it.message ?: "preview failed") }
     }

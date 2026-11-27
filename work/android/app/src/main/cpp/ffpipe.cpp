@@ -219,6 +219,13 @@ struct Pipeline::Impl {
   // it is also true of a stale table, and true of both on a frame with no faces.
   bool frameSourcesValid = false;
 
+  ffmedia::Matcher mediaMatcher;
+  std::vector<int> mediaSlots;
+  bool mediaStill = false;
+  bool mediaSequential = false;
+  bool mediaFrame = false;
+  std::vector<int> mediaSources;
+
   // ---- assignment bookkeeping. Defined out of line further down: they need
   // faceDistance(), which cannot be declared before this struct.
   //
@@ -1226,8 +1233,44 @@ void Pipeline::Impl::rememberAssignment(const float* embeddingNorm, int sourceIn
  * Unassigned faces take the FROZEN default slot in both, so the source row behaves as a
  * brush on both screens: changing it changes nothing until a person is tapped.
  */
+std::vector<ffmedia::Face> Pipeline::mediaFaces(const std::vector<Face>& faces, int w, int h) const {
+  std::vector<ffmedia::Face> result;
+  result.reserve(faces.size());
+  for (const auto& face : faces) {
+    ffmedia::Face detection;
+    for (int i = 0; i < 4; ++i) detection.box[i] = face.box[i] / (i % 2 == 0 ? w : h);
+    std::memcpy(detection.embedding.data(), face.embeddingNorm, sizeof(face.embeddingNorm));
+    result.push_back(detection);
+  }
+  return result;
+}
+
+void Pipeline::setMediaAssignments(std::vector<ffmedia::Face> people, std::vector<int> slots,
+                                   bool still, bool sequential) {
+  p_->mediaMatcher = ffmedia::Matcher(std::move(people));
+  p_->mediaSlots = std::move(slots);
+  p_->mediaStill = still;
+  p_->mediaSequential = sequential;
+}
+
+void Pipeline::beginMediaFrame(const std::vector<Face>& faces, int w, int h) {
+  // ArcFace's distance is half cosine distance. Cap the general reference threshold
+  // for multi-person routing where a false match would apply someone else's source.
+  const auto ids = p_->mediaMatcher.match(mediaFaces(faces, w, h), p_->mediaStill,
+      p_->mediaSequential, std::min(p_->cfg.referenceDistance, 0.26f));
+  p_->mediaSources.clear();
+  for (int id : ids)
+    p_->mediaSources.push_back(ffmedia::sourceFor(id, p_->mediaSlots, p_->sourceSlots.size()));
+  p_->mediaFrame = true;
+}
+
+void Pipeline::endMediaFrame() {
+  p_->mediaFrame = false;
+}
+
 int Pipeline::Impl::sourceForFace(const Face& f, size_t fi, size_t faceCount,
                                   float refDistance) const {
+  if (mediaFrame) return mediaSources[fi];
   if (!assignEnabled) return activeSource;
   if (frameSourcesValid && frameSources.size() == faceCount) return frameSources[fi];
   const FaceAssignment* best = nullptr;
@@ -1803,9 +1846,9 @@ bool Pipeline::syncLip(ffcv::Image& frame, const std::vector<Face>& faces,
     lipRefs = p_->lipRefs;
   }
   const bool byLipReference = !lipRefs.empty();
-  const bool byReference = p_->haveReference;
+  const bool byReference = !p_->mediaFrame && p_->haveReference;
   const Face* only = nullptr;
-  if (!byLipReference && !byReference && cfg.swapLargestOnly) {
+  if (!byLipReference && !byReference && !p_->mediaFrame && cfg.swapLargestOnly) {
     float best = -1.f;
     for (const Face& f : faces) {
       float a = (f.box[2] - f.box[0]) * (f.box[3] - f.box[1]);
@@ -1849,6 +1892,7 @@ bool Pipeline::syncLip(ffcv::Image& frame, const std::vector<Face>& faces,
     if (byReference &&
         faceDistance(f.embeddingNorm, p_->refEmbeddingNorm) >= cfg.referenceDistance)
       continue;
+    if (p_->mediaFrame && p_->mediaSources[fi] == kNoSource) continue;
     if (byLipReference) {
       if (lipBest[fi] < 0) continue;
     } else {
@@ -1994,11 +2038,11 @@ bool Pipeline::swapAll(ffcv::Image& frame, const std::vector<Face>& faces) {
   // reference that is set is the whole selector, and `one` is what the app falls back to
   // when there is none. Doing it the other way round would let "largest" quietly override
   // a face the user chose by hand, which is the one selection they made deliberately.
-  const bool byReference = p_->haveReference;
+  const bool byReference = !p_->mediaFrame && p_->haveReference;
 
   // face_selector_mode `one`: the largest detected face by box area.
   const Face* only = nullptr;
-  if (!byReference && cfg.swapLargestOnly) {
+  if (!byReference && !p_->mediaFrame && cfg.swapLargestOnly) {
     float best = -1.f;
     for (const Face& f : faces) {
       float a = (f.box[2] - f.box[0]) * (f.box[3] - f.box[1]);
@@ -2130,7 +2174,7 @@ bool Pipeline::enhance(ffcv::Image& frame, const std::vector<Face>& faces) {
   ffcv::MatF mask = ffcv::createBoxMask(CS, CS, cfg.maskBlur, cfg.maskPadding);
 
   const Face* only = nullptr;
-  if (cfg.swapLargestOnly) {
+  if (!p_->mediaFrame && cfg.swapLargestOnly) {
     float best = -1.f;
     for (const Face& f : faces) {
       float a = (f.box[2] - f.box[0]) * (f.box[3] - f.box[1]);
@@ -2359,7 +2403,7 @@ bool Pipeline::editFaces(ffcv::Image& frame, const std::vector<Face>& faces) {
   ffcv::MatF mask = ffcv::createBoxMask(kLpCrop, kLpCrop, cfg.maskBlur, noPadding);
 
   const Face* only = nullptr;
-  if (cfg.swapLargestOnly) {
+  if (!p_->mediaFrame && cfg.swapLargestOnly) {
     float best = -1.f;
     for (const Face& f : faces) {
       float a = (f.box[2] - f.box[0]) * (f.box[3] - f.box[1]);

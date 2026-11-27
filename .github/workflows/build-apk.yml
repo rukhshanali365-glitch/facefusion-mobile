@@ -38,45 +38,13 @@ jobs:
           sdkmanager "platforms;android-35" "build-tools;34.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
           mkdir -p "$RUNNER_TEMP/log-artifact"
 
-      - name: Stage native libs verbatim from upstream v0.9.41 APK
-        shell: bash
+      - name: Stage QNN runtimes and ncnn Vulkan
+        run: bash scripts/stage-android-ci.sh "$RUNNER_TEMP"
+
+      - name: Run native identity regression tests
         run: |
-          set -eux
-          # Stage into a directory OUTSIDE src/main/jniLibs. src/main/jniLibs is
-          # Gradle's default jniLibs source, so if we also passed it explicitly
-          # via -PprebuiltNativeDir we'd get every .so packaged TWICE, which
-          # makes an APK that vivo's package parser rejects as "invalid package".
-          # Also scrub any stray jniLibs that may have been committed so the
-          # default source dir contributes NOTHING.
-          rm -rf "$GITHUB_WORKSPACE/work/android/app/src/main/jniLibs"
-          NATIVE_DIR="$RUNNER_TEMP/jniLibs"
-          mkdir -p "$NATIVE_DIR/arm64-v8a"
-          UPSTREAM_URL="https://github.com/AbrahamPaulJ/facefusion-mobile/releases/download/v0.9.41/facefusion-mobile-0.9.41-release.apk"
-          echo "Downloading upstream APK from $UPSTREAM_URL"
-          curl -fL --retry 5 --retry-delay 2 --max-time 300 \
-            -H "Accept: application/octet-stream" \
-            "$UPSTREAM_URL" -o "$RUNNER_TEMP/upstream.apk"
-          ls -lh "$RUNNER_TEMP/upstream.apk"
-          echo "--- listing .so files ---"
-          unzip -Z1 "$RUNNER_TEMP/upstream.apk" | grep -E '^lib/arm64-v8a/.*\.so$' | tee "$RUNNER_TEMP/native-files.txt"
-          echo "--- file count ---"
-          wc -l "$RUNNER_TEMP/native-files.txt"
-          test -s "$RUNNER_TEMP/native-files.txt"
-          COPIED=0
-          while IFS= read -r entry; do
-            [ -z "$entry" ] && continue
-            name="${entry##*/}"
-            unzip -p "$RUNNER_TEMP/upstream.apk" "$entry" > "$NATIVE_DIR/arm64-v8a/$name"
-            COPIED=$((COPIED+1))
-          done < "$RUNNER_TEMP/native-files.txt"
-          echo "Staged $COPIED native libraries from upstream APK:"
-          ls -lh "$NATIVE_DIR/arm64-v8a"
-          test -f "$NATIVE_DIR/arm64-v8a/libffnative.so"
-          echo "libffnative.so size:"
-          ls -lh "$NATIVE_DIR/arm64-v8a/libffnative.so"
-          # Export NATIVE_DIR for the next step(s) via $GITHUB_ENV so we
-          # don't have to recompute the path.
-          echo "NATIVE_DIR=$NATIVE_DIR" >> "$GITHUB_ENV"
+          c++ -std=c++17 -Wall -Wextra -Werror work/android/tests/media-identity.cpp -o "$RUNNER_TEMP/media-identity"
+          "$RUNNER_TEMP/media-identity"
 
       - name: Provision a stable signing key (same on every CI run)
         shell: bash
@@ -102,7 +70,7 @@ jobs:
           echo "--- keystore ready ---"
           ls -l "$KS" work/android/keystore.properties
 
-      - name: Build RELEASE APK (installable over any prior build)
+      - name: Build ARM64 release APK from source
         working-directory: work/android
         shell: bash
         run: |
@@ -112,19 +80,7 @@ jobs:
           # properties are resolved against the daemon working directory.
           KS_ABS="$GITHUB_WORKSPACE/work/android/keystore.jks"
           test -f "$KS_ABS"
-          # Point Gradle at the prebuilt native libs we unpacked OUTSIDE
-          # src/main/jniLibs in the previous step (see comment there).
-          # NATIVE_DIR is exported via $GITHUB_ENV from the staging step.
-          test -f "$NATIVE_DIR/arm64-v8a/libffnative.so"
-          echo "Using prebuilt native dir: $NATIVE_DIR"
-          # Pipe gradle output to CI log AND save to artifact for debugging.
           ./gradlew --no-daemon :app:assembleRelease \
-            -PprebuiltNativeDir="$NATIVE_DIR" \
-            -PjniLibsRuntimeDir="$NATIVE_DIR" \
-            -Pandroid.injected.signing.store.file="$KS_ABS" \
-            -Pandroid.injected.signing.store.password=facefusion \
-            -Pandroid.injected.signing.key.alias=facefusion \
-            -Pandroid.injected.signing.key.password=facefusion \
             -Pandroid.injected.testOnly=false \
             --stacktrace 2>&1 | tee "$RUNNER_TEMP/assemble.log"
           rc=${PIPESTATUS[0]}
@@ -146,7 +102,6 @@ jobs:
           if-no-files-found: ignore
 
       - name: Run unit tests
-        continue-on-error: true
         working-directory: work/android
         shell: bash
         run: |
@@ -178,7 +133,7 @@ jobs:
           set -euo pipefail
           echo "APK outputs found:"
           find work/android -type f -path '*/build/outputs/apk/*/*.apk' -print
-          APK="$(find work/android -type f -path '*/build/outputs/apk/*/*.apk' -name '*.apk' -print -quit)"
+          APK="$(find work/android/app/build/outputs/apk/release -type f -name '*.apk' -print -quit)"
           test -n "$APK"
           test -s "$APK"
           echo "Raw APK from Gradle: $APK"
@@ -198,6 +153,10 @@ jobs:
           fi
           echo "--- APK native-lib entry list ---"
           unzip -l "$APK" | grep -E "lib/arm64-v8a/.*\\.so$|classes.dex|AndroidManifest|resources.arsc" | head -40
+          unzip -p "$APK" lib/arm64-v8a/libffnative.so > "$RUNNER_TEMP/libffnative.so"
+          readelf -h "$RUNNER_TEMP/libffnative.so" | grep AArch64
+          readelf --dyn-syms --wide "$RUNNER_TEMP/libffnative.so" > "$RUNNER_TEMP/native-symbols.txt"
+          grep -q 'Java_com_facefusion_mobile_NativePipe_processMediaFrameAt' "$RUNNER_TEMP/native-symbols.txt"
           echo "--- ZIP alignment check (each .so and classes.dex must show 'OK') ---"
           if [ -x "$BUILDTOOLS/zipalign" ]; then
             "$BUILDTOOLS/zipalign" -c -v -p 4 "$APK" 2>&1 | grep -E "lib/arm64|classes\\.dex|resources.arsc|Verification" | head -30
@@ -215,97 +174,14 @@ jobs:
           retention-days: 14
 
       - name: Publish APK to GitHub Release
-        if: success()
+        if: success() && github.ref_name == github.event.repository.default_branch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           TAG="ci-apk-$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}"
-          cp "$RUNNER_TEMP/face-mma.apk" "./face-mma-$TAG.apk"
-          SHA=$(sha256sum "./face-mma-$TAG.apk" | awk '{print $1}')
-          cat > release-notes.md <<EOF
-          # Face MMA APK — $TAG
-
-          Built from commit \`${GITHUB_SHA}\` on branch \`${GITHUB_REF_NAME}\`.
-
-          **Download**: \`face-mma-$TAG.apk\` (asset below, ~71 MB)
-          **SHA-256**: \`$SHA\`
-          **Package**: \`com.facefusion.mobile\` — **release buildType**, zip-aligned,
-          signed with v1 + v2 + v3 APK signatures using a stable CI key (the same
-          key every CI run uses, so each new APK upgrades over the previous one
-          without uninstalling).
-
-          ## What is in this build — **MMA Face v2.3** — package/install fix + CPU-correct swap
-
-          v2.2 had the **correct** face-swap code (CPU-pinned ncnn on non-Qualcomm,
-          settings migration, dynamic thread count) but the APK itself was
-          malformed in a way that vivo Funtouch OS 15 rejects with
-
-          > لم يتم تثبيت الحزمة لأنها غير صالحة
-          > (package could not be installed because it is invalid)
-
-          v2.3 fixes the packaging so the APK actually installs:
-
-          1. **Duplicate native libraries removed.** Previously we copied every .so
-             from the upstream APK into \`src/main/jniLibs/\` AND also passed that
-             same directory to Gradle via \`-PprebuiltNativeDir\`. Gradle's default
-             jniLibs source \`src/main/jniLibs\` was already picking the files up,
-             so every \`lib*.so\` was packaged **twice** in the APK. Many OEM
-             package parsers (vivo/Funtouch, OPPO/ColorOS) reject that as an
-             invalid package. Native libs are now staged in a temp directory
-             outside \`src/main\` and packaged exactly once.
-          2. **Post-build zipalign + explicit v1+v2+v3 signing.** CI now runs
-             \`zipalign -f -p 4\` and then \`apksigner sign --v1-signing-enabled
-             true --v2-signing-enabled true --v3-signing-enabled true\` so every
-             APK signature scheme is covered. Some OEM installers still require
-             the v1 (JAR) signature even on Android 15.
-          3. **\`isDebuggable=false\` release buildType**, no \`testOnly\` flag, no
-             \`applicationIdSuffix\`. App id stays \`com.facefusion.mobile\` on
-             every build so upgrades work and Package Installer treats it as a
-             normal release APK.
-          4. **apksigner verify** runs in CI and the log now shows the packaged
-             .so list; any future regression in packaging will be caught in CI,
-             not on your phone.
-
-          ### Swap correctness (carried over from v2.2)
-
-          The native layer is repackaged **verbatim** from the official upstream
-          v0.9.41 release APK (~84 MB libffnative.so + all QNN/ncnn backends +
-          libc++_shared.so). No C++ is recompiled in CI, so there is no SIMD/
-          packing miscompile.
-
-          - **Mali/PowerVR Vulkan hard-off on non-Qualcomm SoCs** (MediaTek,
-            Exynos, Kirin, UNISOC) — that was the root cause of the melted /
-            split / warped faces on your Dimensity. Qualcomm Snapdragon keeps
-            Vulkan (Adreno is correct).
-          - **Settings migration (v3):** wipes any pre-v3 cached options that
-            were forcing weight 0.55, pixelBoost 2, blur 0.30 etc. and resets to
-            stock upstream defaults. Values are range-clamped on load so a
-            corrupted pref can never reintroduce bad tuning.
-          - **Dynamic ncnn thread count** based on \`largeMemoryClass\`: 1 / 2 / 3
-            / 4 threads (vivo V60 Lite 8 GB → 4 threads on big cores). Expect
-            roughly 3× faster than v2.1. 10–20× is not realistic in pure CPU
-            ncnn on a mid-range octa-core at 256 px; 3–4× is the ceiling.
-
-          ### Also in
-
-          - Big explicit NSFW ON / OFF buttons (red/blue, side-by-side).
-          - MMA Face wordmark + new two-face launcher icon.
-          - Full Arabic (RTL) UI.
-          - Crash-report popup at next launch including device info.
-          - Adjustable NSFW sensitivity 0–100, persisted.
-
-          ## Install — IMPORTANT
-
-          Because v2.2 was signed with the **same CI key** but its APK was
-          malformed, Funtouch may still hold a cached "invalid package" record.
-          Please **uninstall any prior build first** (Settings → Apps → MMA Face
-          / FaceFusion / FaceFusion Debug → Uninstall, **for every user/work
-          profile on the phone**), then install this APK. After this, future
-          builds should upgrade in place without uninstalling.
-          EOF
+          SHA=$(sha256sum "$RUNNER_TEMP/face-mma.apk" | awk '{print $1}')
           gh release create "$TAG" \
             --title "Face MMA APK $TAG" \
-            --notes-file release-notes.md \
-            "./face-mma-$TAG.apk"
-          echo "Release URL: https://github.com/${GITHUB_REPOSITORY}/releases/tag/$TAG"
+            --notes "ARM64 APK built from $GITHUB_SHA. SHA-256 $SHA. See work/android/BUILDING.md for installation and verification." \
+            "$RUNNER_TEMP/face-mma.apk"

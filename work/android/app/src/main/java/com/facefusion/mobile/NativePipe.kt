@@ -336,6 +336,18 @@ object NativePipe {
     @JvmStatic external fun resizeBgr(bgr: ByteArray, w: Int, h: Int,
                                       dw: Int, dh: Int): ByteArray?
 
+    @JvmStatic external fun discoverMediaFaces(
+        bgr: ByteArray, w: Int, h: Int, gallery: FloatArray,
+    ): FloatArray
+
+    @JvmStatic external fun setMediaAssignments(
+        gallery: FloatArray, sources: IntArray, still: Boolean, sequential: Boolean,
+    ): Boolean
+
+    @JvmStatic external fun processMediaFrameAt(
+        bgr: ByteArray, w: Int, h: Int, frameIndex: Int,
+    ): Int
+
     @JvmStatic external fun detectFaces(bgr: ByteArray, w: Int, h: Int): FloatArray
 
     /**

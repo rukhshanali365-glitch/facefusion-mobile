@@ -658,7 +658,7 @@ Turning it off runs your own Swap settings instead. This is experimental: the en
     <string name="live_assign_kept">This person keeps their own face</string>
     <string name="swap_assign_on">Nothing changes until you tap a person</string>
     <string name="swap_assign_off">Every face takes the selected source</string>
-    <string name="swap_assign_hint">Pick a source (or Keep face), then tap a person below. People you do not tap take the source that was selected when you turned this on.</string>
+    <string name="swap_assign_hint">Pick a source, then tap a person. Unassigned faces stay unchanged.</string>
     <string name="swap_assign_no_people">No faces found in the frame shown. Move the trim handle to a frame with the people you want to assign.</string>
     <string name="swap_assign_person">Person %1$d</string>
     <string name="swap_assign_badge">S%1$d</string>
@@ -729,4 +729,9 @@ Turning it off runs your own Swap settings instead. This is experimental: the en
     <string name="mma_model_missing_summary">%1$d file(s) missing or corrupt — tap Repair.</string>
     <string name="mma_fix_dialog_title">Repair models</string>
     <string name="mma_fix_dialog_body">Missing or corrupt files will be re-downloaded. Healthy files are left untouched. This does not delete any of your settings.</string>
+    <string name="swap_seek">Seek video</string>
+    <string name="swap_trim">Trim export</string>
+    <string name="swap_discovering_people">Finding faces across the target…</string>
+    <string name="swap_pick_source_to_assign">Add a source face to assign it to a person.</string>
+    <string name="swap_photo_too_large">This device can process photos up to about %1$d megapixels at original size.</string>
 </resources>

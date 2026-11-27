@@ -10,6 +10,8 @@
 //             -> warp 112 -> [arcface] -> warp 256 -> [swapper] -> box mask -> paste back
 
 #pragma once
+
+#include "ffmedia.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -239,6 +241,12 @@ class Pipeline {
                             bool noTrack = false);
 
   // The source identity: the largest face of the source image, embedding only.
+  std::vector<ffmedia::Face> mediaFaces(const std::vector<Face>& faces, int w, int h) const;
+  void setMediaAssignments(std::vector<ffmedia::Face> people, std::vector<int> slots,
+                           bool still, bool sequential);
+  void beginMediaFrame(const std::vector<Face>& faces, int w, int h);
+  void endMediaFrame();
+
   // Detector tracking, in FRAMES between real detections. 0 disables it.
   //
   // ⚠ Set this ONLY for sequential decode. analyse() is also the preview path, where

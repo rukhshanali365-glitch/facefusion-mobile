@@ -6,6 +6,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.os.SystemClock
+import kotlinx.coroutines.ensureActive
 import java.io.Closeable
 import java.nio.ByteBuffer
 
@@ -67,51 +68,73 @@ class FrameSeeker private constructor(
         extractor.seekTo(timeUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
         runCatching { decoder.flush() }.getOrElse { return null }
 
+        val cursor = DecodeCursor()
         var best: ByteArray? = null
-        var inputDone = false
-        val info = MediaCodec.BufferInfo()
-        val deadline = SystemClock.uptimeMillis() + DEADLINE_MS
+        var reachedTarget = false
+        while (!cursor.ended) {
+            val frame = nextFrame(cursor, timeUs, firstAsFallback = best == null) ?: break
+            best = frame.bgr
+            reachedTarget = frame.ptsUs >= timeUs - SLACK_US
+            if (reachedTarget) break
+        }
+        return if (cursor.ended && timeUs > 0L && best != null && !reachedTarget) null else upright(best)
+    }
 
-        while (SystemClock.uptimeMillis() < deadline) {
-            if (!inputDone) {
+    /** Decode once in presentation order, converting only frames used by discovery. */
+    suspend fun scanFrames(intervalUs: Long, onFrame: suspend (ByteArray) -> Boolean): Boolean {
+        val cursor = DecodeCursor()
+        var nextUs = 0L
+        while (!cursor.ended) {
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+            val frame = nextFrame(cursor, nextUs) ?: return cursor.ended
+            if (!onFrame(upright(frame.bgr) ?: return false)) return false
+            nextUs = frame.ptsUs + intervalUs
+        }
+        return true
+    }
+
+    private class DecodeCursor {
+        var inputDone = false
+        var ended = false
+        val info = MediaCodec.BufferInfo()
+    }
+
+    private data class Decoded(val bgr: ByteArray, val ptsUs: Long)
+
+    private fun nextFrame(cursor: DecodeCursor, timeUs: Long, firstAsFallback: Boolean = false): Decoded? {
+        val deadline = SystemClock.uptimeMillis() + DEADLINE_MS
+        val info = cursor.info
+        while (!cursor.ended && SystemClock.uptimeMillis() < deadline) {
+            if (!cursor.inputDone) {
                 val inIx = decoder.dequeueInputBuffer(TIMEOUT_US)
                 if (inIx >= 0) {
-                    val buf = decoder.getInputBuffer(inIx)
-                    val n = if (buf == null) -1 else extractor.readSampleData(buf, 0)
-                    if (n < 0) {
+                    val buffer = decoder.getInputBuffer(inIx)
+                    val size = if (buffer == null) -1 else extractor.readSampleData(buffer, 0)
+                    if (size < 0) {
                         decoder.queueInputBuffer(inIx, 0, 0, 0,
-                                                 MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                        inputDone = true
+                            MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        cursor.inputDone = true
                     } else {
-                        decoder.queueInputBuffer(inIx, 0, n, extractor.sampleTime, 0)
+                        decoder.queueInputBuffer(inIx, 0, size, extractor.sampleTime, 0)
                         extractor.advance()
                     }
                 }
             }
 
-            when (val outIx = decoder.dequeueOutputBuffer(info, TIMEOUT_US)) {
-                MediaCodec.INFO_TRY_AGAIN_LATER -> if (inputDone) return best
-                MediaCodec.INFO_OUTPUT_FORMAT_CHANGED, MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> {}
-                else -> if (outIx >= 0) {
-                    val eos = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
-                    // SLACK because a container's timestamps need not land on the requested
-                    // microsecond; without it an exact-but-late frame is skipped and the
-                    // search runs to the end of the clip.
-                    val reached = info.presentationTimeUs >= timeUs - SLACK_US
-                    if (info.size > 0 && (reached || best == null)) {
-                        // Every frame until the target is kept, so a seek that overshoots
-                        // the end still answers with the nearest frame it saw.
-                        runCatching { decoder.getOutputImage(outIx) }.getOrNull()?.let { img ->
-                            best = imageToBgr(img)
-                            img.close()
-                        }
-                    }
-                    decoder.releaseOutputBuffer(outIx, false)
-                    if (reached || eos) return upright(best)
+            val outIx = decoder.dequeueOutputBuffer(info, TIMEOUT_US)
+            if (outIx < 0) continue
+            try {
+                cursor.ended = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
+                val reached = info.presentationTimeUs >= timeUs - SLACK_US
+                if (info.size > 0 && (reached || firstAsFallback)) {
+                    val bgr = decoder.getOutputImage(outIx)?.use { imageToBgr(it) }
+                    if (bgr != null) return Decoded(bgr, info.presentationTimeUs)
                 }
+            } finally {
+                decoder.releaseOutputBuffer(outIx, false)
             }
         }
-        return upright(best)
+        return null
     }
 
     private fun upright(bgr: ByteArray?): ByteArray? {

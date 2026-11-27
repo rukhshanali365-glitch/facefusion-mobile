@@ -63,6 +63,7 @@ class VideoSwapper(
      * including when it is cancelled.
      */
     private val trackPeriod: Int = 0,
+    private val mediaAssignments: Boolean = false,
     /**
      * Run the lip syncer after the swap.
      *
@@ -104,6 +105,18 @@ class VideoSwapper(
     private var encTrack = -1
 
     fun swap(inputPath: String, outputPath: String): Result<String> = runCatching {
+        val cleanup = ArrayDeque<() -> Unit>()
+        try {
+            swapOwned(inputPath, outputPath, cleanup)
+        } finally {
+            while (cleanup.isNotEmpty()) {
+                runCatching { cleanup.removeLast().invoke() }
+            }
+            NativePipe.setTrackPeriod(0)
+        }
+    }
+
+    private fun swapOwned(inputPath: String, outputPath: String, cleanup: ArrayDeque<() -> Unit>): String {
         // Shadows the constructor property for the rest of this function: `voicePath` means
         // NOTHING when `lipSync` is off, but a caller that toggled Lip Sync off without also
         // clearing its own remembered voice file would otherwise still redirect the OUTPUT's
@@ -112,7 +125,9 @@ class VideoSwapper(
         // purpose (re-enabling Lip Sync should not force re-picking one). The invariant
         // belongs HERE, not in every caller: a voice with nothing to drive is not a voice.
         val voicePath = if (lipSync) voicePath else null
-        val extractor = MediaExtractor().apply { setDataSource(inputPath) }
+        val extractor = MediaExtractor()
+        cleanup.addLast { extractor.release() }
+        extractor.setDataSource(inputPath)
         var videoTrack = -1
         var audioTrack = -1
         var format: MediaFormat? = null
@@ -131,13 +146,15 @@ class VideoSwapper(
         // (an audio file has no video track at all, so it cannot share `extractor`).
         var audioExtractor = extractor
         if (voicePath != null) {
-            val ve = MediaExtractor().apply { setDataSource(voicePath) }
+            val ve = MediaExtractor()
+            cleanup.addLast { ve.release() }
+            ve.setDataSource(voicePath)
             var vTrack = -1
             for (i in 0 until ve.trackCount) {
                 if (ve.getTrackFormat(i).getString(MediaFormat.KEY_MIME)
                         ?.startsWith("audio/") == true) { vTrack = i; break }
             }
-            if (vTrack >= 0) { audioTrack = vTrack; audioExtractor = ve } else ve.release()
+            if (vTrack >= 0) { audioTrack = vTrack; audioExtractor = ve }
         }
         // STORED dimensions. For a portrait clip these are landscape, with the upright
         // orientation carried separately as a rotation flag.
@@ -308,12 +325,20 @@ class VideoSwapper(
         if (trimStartUs > 0) extractor.seekTo(trimStartUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
 
         val decoder = MediaCodec.createDecoderByType(vf.getString(MediaFormat.KEY_MIME)!!)
+        cleanup.addLast {
+            runCatching { decoder.stop() }
+            decoder.release()
+        }
         vf.setInteger(MediaFormat.KEY_COLOR_FORMAT,
             MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible)
         decoder.configure(vf, null, null, 0)
         decoder.start()
 
         val encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        cleanup.addLast {
+            runCatching { encoder.stop() }
+            encoder.release()
+        }
 
         // The encoder is sized to the UPRIGHT frame, so the output needs no orientation
         // hint of its own -- the rotation is baked into the pixels.
@@ -342,8 +367,6 @@ class VideoSwapper(
             encoder.start()
         }.onFailure { e ->
             val name = runCatching { encoder.codecInfo.name }.getOrDefault("encoder")
-            encoder.release()
-            decoder.stop(); decoder.release()
             error(codecWhy(e, "$name refused ${encW}x$encH @ ${fps}fps, " +
                               "${bitrate / 1000} kbps"))
         }
@@ -354,6 +377,14 @@ class VideoSwapper(
         val runStartMs = System.currentTimeMillis()
 
         val muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+        var completed = false
+        cleanup.addLast {
+            try {
+                muxer.release()
+            } finally {
+                if (!completed) File(outputPath).delete()
+            }
+        }
         var muxAudio = -1
         var muxing = false
         // A separate voice file has its OWN timeline, unrelated to the target's trim -- take
@@ -487,8 +518,7 @@ class VideoSwapper(
                     if (image != null) {
                         // Upright FIRST: everything after this -- detection, the swap, the
                         // preview, the encoder -- works on the frame the viewer will see.
-                        val decoded = imageToBgr(image, width, height)
-                        image.close()
+                        val decoded = image.use { imageToBgr(it, width, height) }
                         val upright = if (rotation == 0) decoded
                                       else NativePipe.rotateBgr(decoded, width, height, rotation)
                         // Downscale BEFORE anything looks at the frame, so the detector,
@@ -500,8 +530,10 @@ class VideoSwapper(
                                       ?: error("resize to ${outW}x$outH failed")
                         // `swapped` is the OUTPUT frame index: it counts frames written,
                         // so it already accounts for the ones decimation dropped.
-                        val faces = NativePipe.processFrameAt(bgr, outW, outH,
-                                                              if (syncing) swapped else -1)
+                        val frameIndex = if (syncing) swapped else -1
+                        val faces = if (mediaAssignments)
+                            NativePipe.processMediaFrameAt(bgr, outW, outH, frameIndex)
+                        else NativePipe.processFrameAt(bgr, outW, outH, frameIndex)
                         if (faces < 0) error("native: ${NativePipe.lastError()}")
                         onFrame(bgr, outW, outH)
                         feedEncoder(encoder, cropBgr(bgr, outW, outH, encW, encH),
@@ -525,12 +557,6 @@ class VideoSwapper(
         // added, and an MP4 with no tracks is not a file anything can open. That is the one
         // case where there is genuinely nothing to keep.
         if (!muxing) {
-            decoder.stop(); decoder.release()
-            encoder.stop(); encoder.release()
-            extractor.release()
-            if (audioExtractor !== extractor) audioExtractor.release()
-            muxer.release()
-            File(outputPath).delete()
             error(if (cancelled) "cancelled before any frame was written" else "no frames encoded")
         }
 
@@ -557,10 +583,10 @@ class VideoSwapper(
         }.onFailure { onLog("audio: writing the transcode failed " +
                             "(${it.javaClass.simpleName}), video kept") }
         else if (audioTrack >= 0 && muxAudio >= 0) runCatching {
-            val ae = MediaExtractor().apply {
-                setDataSource(voicePath ?: inputPath); selectTrack(audioTrack)
-            }
+            val ae = MediaExtractor()
             try {
+                ae.setDataSource(voicePath ?: inputPath)
+                ae.selectTrack(audioTrack)
                 if (copyStartUs > 0) ae.seekTo(copyStartUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
                 val buf = ByteBuffer.allocate(512 * 1024)
                 val ai = MediaCodec.BufferInfo()
@@ -588,12 +614,8 @@ class VideoSwapper(
             }
         }.onFailure { onLog("audio: copy-through failed (${it.javaClass.simpleName}), video kept") }
 
-        decoder.stop(); decoder.release()
-        encoder.stop(); encoder.release()
-        muxer.stop(); muxer.release()
-        extractor.release()
-        if (audioExtractor !== extractor) audioExtractor.release()
-        NativePipe.setTrackPeriod(0)
+        muxer.stop()
+        completed = true
         onLog((if (cancelled) "partial: " else "") +
               "wrote ${File(outputPath).length() / 1024} KB, $swapped frames")
         // The headline number, spelled out rather than left to be divided out of the stage
@@ -604,7 +626,7 @@ class VideoSwapper(
                 .format(swapped * 1000.0 / elapsedMs, elapsedMs.toDouble() / swapped,
                         swapped, elapsedMs / 1000.0))
         NativePipe.stageMillis().takeIf { it.isNotEmpty() }?.let(onLog)
-        outputPath
+        return outputPath
     }
 
     /** One encoded AAC frame, held until the muxer has a track to take it. */

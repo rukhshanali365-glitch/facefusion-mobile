@@ -93,7 +93,7 @@
     <string name="live_assign_hint">تعيين لكل شخص: اختر مصدرًا ثم اضغط على وجه. الوجوه التي لا تضغط عليها تبقى على مصدرها.</string>
     <string name="swap_assign_on">لا شيء يتغير حتى تضغط على شخص</string>
     <string name="swap_assign_off">كل وجه يأخذ المصدر المختار</string>
-    <string name="swap_assign_hint">اختر مصدرًا (أو احتفاظ بالوجه الأصلي)، ثم اضغط على شخص بالأسفل. الأشخاص الذين لا تضغط عليهم يأخذون المصدر الذي كان محددًا عند التشغيل.</string>
+    <string name="swap_assign_hint">اختر مصدرًا ثم اضغط على شخص. تبقى الوجوه غير المعينة كما هي.</string>
     <string name="set_tab_models">النماذج</string>
     <string name="set_tab_device">الجهاز</string>
     <string name="set_tab_api">واجهة API</string>
@@ -205,4 +205,9 @@
     <string name="notif_batch_text">مقطع %1$d من %2$d: %3$s</string>
     <string name="notif_batch_channel">تبديل الدُفعات</string>
 
+    <string name="swap_seek">التنقل في الفيديو</string>
+    <string name="swap_trim">قص الفيديو عند التصدير</string>
+    <string name="swap_discovering_people">جارٍ البحث عن الوجوه في الوسائط…</string>
+    <string name="swap_pick_source_to_assign">أضف وجهًا مصدرًا لتعيينه لشخص.</string>
+    <string name="swap_photo_too_large">يستطيع هذا الجهاز معالجة الصور بحجمها الأصلي حتى نحو %1$d ميغابكسل.</string>
 </resources>

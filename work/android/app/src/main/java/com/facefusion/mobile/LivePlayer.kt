@@ -165,7 +165,7 @@ class LivePlayer {
      * camera's results to Compose, so this follows it rather than posting to the main
      * looper per frame.
      */
-    fun start(path: String, onShot: (Shot) -> Unit) {
+    fun start(path: String, mediaAssignments: Boolean = false, onShot: (Shot) -> Unit) {
         stop()
         stopping = false
         seekTargetMs = -1
@@ -179,7 +179,7 @@ class LivePlayer {
         durationMs = durationOf(path)
         audioOk = openAudio(path)
         active = true
-        thread = Thread({ pump(path, onShot) }, "ffplayer").apply { start() }
+        thread = Thread({ pump(path, mediaAssignments, onShot) }, "ffplayer").apply { start() }
     }
 
     fun play() {
@@ -284,7 +284,7 @@ class LivePlayer {
 
     // ------------------------------------------------------------------ the pump
 
-    private fun pump(path: String, onShot: (Shot) -> Unit) {
+    private fun pump(path: String, mediaAssignments: Boolean, onShot: (Shot) -> Unit) {
         var extractor: MediaExtractor? = null
         var decoder: MediaCodec? = null
         try {
@@ -484,7 +484,9 @@ class LivePlayer {
                         // In place: processFrame writes the swap back into `up`, and
                         // leaves it BYTE-IDENTICAL when it found no face -- which is why
                         // `faces` is reported rather than inferred from the picture.
-                        val n = NativePipe.processFrame(up, outW, outH)
+                        val n = if (mediaAssignments)
+                            NativePipe.processMediaFrameAt(up, outW, outH, -1)
+                        else NativePipe.processFrame(up, outW, outH)
                         if (n < 0) {
                             onShot(Shot(null, ptsMs, fps, 0, dropped, NativePipe.lastError()))
                         } else {
